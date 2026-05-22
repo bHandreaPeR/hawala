@@ -1104,6 +1104,110 @@ def _oi_chart_section(data):
   </div>"""
 
 
+# ── Healthcheck block (May 2026) ──────────────────────────────────────────────
+# Reads v3/cache/healthcheck_latest.json (written by ops/healthcheck.py at 07:25).
+# Renders a compact status block at top of newsletter — green on all-pass,
+# red on any fail. Always visible so user catches infra issues before market open.
+
+def _healthcheck_block() -> str:
+    import json, pathlib
+    p = pathlib.Path(__file__).resolve().parent / 'v3' / 'cache' / 'healthcheck_latest.json'
+    if not p.exists():
+        return ('<div class="alert alert-yellow"><b>⚠ Healthcheck data missing.</b>'
+                ' Did ops/healthcheck.py run at 07:25 IST?</div>')
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:
+        return f'<div class="alert alert-yellow"><b>⚠ Healthcheck JSON unreadable:</b> {_e(str(e))}</div>'
+
+    n_pass, n_warn, n_fail = d.get('n_pass',0), d.get('n_warn',0), d.get('n_fail',0)
+    overall = d.get('overall','UNKNOWN')
+
+    # All-pass: compact green banner
+    if overall == 'PASS' and n_warn == 0:
+        return (f'<div class="alert alert-green">'
+                f'<b>✓ Healthcheck PASS</b> — {n_pass} checks green '
+                f'<span style="opacity:0.7">({_e(d.get("ts","")[:16])})</span></div>')
+
+    # Otherwise: detailed block with failed/warning rows
+    fails = [c for c in d.get('checks',[]) if c.get('status') == 'FAIL']
+    warns = [c for c in d.get('checks',[]) if c.get('status') == 'WARN']
+
+    banner_class = 'alert-red' if n_fail > 0 else 'alert-yellow'
+    banner_emoji = '✗' if n_fail > 0 else '⚠'
+    parts = [f'<div class="alert {banner_class}">'
+             f'<b>{banner_emoji} Healthcheck — {n_fail} FAIL · {n_warn} WARN · '
+             f'{n_pass} PASS</b><br>']
+    if fails:
+        parts.append('<b>Failures:</b><ul style="margin:6px 0 6px 18px;padding:0">')
+        for c in fails[:15]:
+            parts.append(f'<li>[{_e(c["cat"])}] <b>{_e(c["label"])}</b>: '
+                          f'{_e(c["detail"][:200])}</li>')
+        if len(fails) > 15:
+            parts.append(f'<li>… and {len(fails)-15} more failures</li>')
+        parts.append('</ul>')
+    if warns:
+        parts.append('<b>Warnings:</b><ul style="margin:6px 0 6px 18px;padding:0">')
+        for c in warns[:10]:
+            parts.append(f'<li>[{_e(c["cat"])}] <b>{_e(c["label"])}</b>: '
+                          f'{_e(c["detail"][:200])}</li>')
+        if len(warns) > 10:
+            parts.append(f'<li>… and {len(warns)-10} more warnings</li>')
+        parts.append('</ul>')
+    parts.append(f'<div style="opacity:0.7;font-size:11px">'
+                  f'Generated {_e(d.get("ts","")[:19])} · '
+                  f'See ops/healthcheck.py for what each check covers.</div>')
+    parts.append('</div>')
+    return _autoheal_block() + "\n".join(parts)
+
+
+def _autoheal_block() -> str:
+    """Render the autoheal routine's result — what was auto-fixed at 06:55,
+    what still needs a human. Reads v3/cache/autoheal_latest.json."""
+    import json, pathlib
+    p = pathlib.Path(__file__).resolve().parent / 'v3' / 'cache' / 'autoheal_latest.json'
+    if not p.exists():
+        return ''   # autoheal not yet run — healthcheck block alone suffices
+    try:
+        d = json.loads(p.read_text())
+    except Exception:
+        return ''
+
+    fixed   = [f for f in d.get('fixed', []) if not f.get('dry_run')]
+    failed  = d.get('failed_to_fix', [])
+    unfix   = d.get('unfixable', [])
+    streak  = d.get('green_streak', 0)
+    stable  = d.get('stable', False)
+    needs_human = failed + unfix
+
+    # All-clean: compact green line
+    if not fixed and not needs_human:
+        tag = f' · ✅ STABLE ({streak}d clean)' if stable else f' · streak {streak}d'
+        return (f'<div class="alert alert-green">'
+                f'<b>🔧 Autoheal: nothing to fix</b>{tag}</div>')
+
+    cls = 'alert-red' if needs_human else 'alert-yellow'
+    parts = [f'<div class="alert {cls}">'
+             f'<b>🔧 Autoheal — {len(fixed)} auto-fixed · '
+             f'{len(needs_human)} need a human</b><br>']
+    if fixed:
+        parts.append('<b>Auto-fixed at 06:55:</b><ul style="margin:6px 0 6px 18px">')
+        for f in fixed:
+            parts.append(f'<li>{_e(f.get("label",""))}</li>')
+        parts.append('</ul>')
+    if needs_human:
+        parts.append('<b>Needs a human:</b><ul style="margin:6px 0 6px 18px">')
+        for u in needs_human:
+            lbl = u.get('label',''); det = u.get('detail','')
+            parts.append(f'<li><b>{_e(lbl)}</b>: {_e(det[:160])}</li>')
+        parts.append('</ul>')
+    parts.append(f'<div style="opacity:0.7;font-size:11px">'
+                  f'pre-fix={_e(d.get("pre_fix_overall",""))} → '
+                  f'post-fix={_e(d.get("post_fix_overall",""))} · '
+                  f'green streak {streak}d</div></div>')
+    return "\n".join(parts)
+
+
 # ── Master HTML builder ───────────────────────────────────────────────────────
 
 def build_html(data: dict) -> str:
@@ -1152,6 +1256,13 @@ def build_html(data: dict) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Hawala v2 — Pre-Market Report | {_e(date_str)}</title>
   <style>{CSS}
+  .alert {{ padding:10px 14px; margin:8px 0 14px; border-radius:6px;
+            font-size:13px; line-height:1.5; }}
+  .alert b {{ font-weight:700; }}
+  .alert ul {{ list-style:disc; }}
+  .alert-green  {{ background:#0d3a1d; color:#cfe8d8; border:1px solid #1f8048; }}
+  .alert-yellow {{ background:#3d3110; color:#f0d99b; border:1px solid #b58a2c; }}
+  .alert-red    {{ background:#3e1414; color:#f5c2c2; border:1px solid #c63838; }}
   </style>
 </head>
 <body>
@@ -1169,6 +1280,8 @@ def build_html(data: dict) -> str:
 </div>
 
 <div class="container">
+
+{_healthcheck_block()}
 
 {macro_alert}
 

@@ -190,9 +190,38 @@ def main() -> None:
     log.info("News runner starting (cycle=%ds, market_hours=%s)",
              CYCLE_SEC, "OFF" if args.always else "9:00–15:30 IST")
 
+    was_in_market = False   # tracks transition for EOD digest emit
+    preopen_done_for = None # date the pre-open snapshot was last captured
+
     while _running:
         now = _now()
-        if not args.always and not _is_market_window(now):
+        in_market = args.always or _is_market_window(now)
+
+        # Pre-open auction snapshot — once per day, when clock crosses 09:10.
+        # news.runner is the only process alive before the v3 runners start
+        # at 09:12, so it hosts this capture (no extra cron). Writes
+        # v3/cache/preopen_signal.json for the runners to read at startup.
+        try:
+            if (preopen_done_for != now.date()
+                    and now.hour == 9 and now.minute >= 10
+                    and now.weekday() < 5):
+                from v3.data.preopen_snapshot import capture as _preopen_capture
+                _preopen_capture()
+                preopen_done_for = now.date()
+                log.info("Pre-open snapshot captured for %s", now.date())
+        except Exception as e:
+            log.exception("Pre-open snapshot failed: %s", e)
+
+        # Edge: in-market → out-of-market (market just closed) → emit EOD digest
+        if was_in_market and not in_market:
+            try:
+                from news.digest import emit_eod_digest
+                emit_eod_digest()
+            except Exception as e:
+                log.exception("emit_eod_digest failed: %s", e)
+        was_in_market = in_market
+
+        if not in_market:
             wait = _seconds_to_next_open(now)
             log.info("Outside market hours — sleeping %.0fs until next open", wait)
             # Sleep in chunks so SIGTERM is responsive
@@ -210,6 +239,14 @@ def main() -> None:
         while _running and slept < CYCLE_SEC:
             time.sleep(min(5.0, CYCLE_SEC - slept))
             slept += 5.0
+
+    # On clean shutdown, also try to flush the digest (covers SIGTERM after 15:30)
+    try:
+        from news.digest import emit_eod_digest, pending_count
+        if pending_count() > 0:
+            emit_eod_digest()
+    except Exception as e:
+        log.exception("Shutdown digest emit failed: %s", e)
 
     log.info("News runner stopped.")
 

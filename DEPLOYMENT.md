@@ -105,15 +105,27 @@ python alert_runner.py
 `alert_runner.py` is **NOT** scheduled — replaced by the v3 runners. It now
 lives in `archived/v2_legacy/`. The defensive `pkill` line still names it.
 
+VP-Trail signal daemon (LIVE since 2026-05-12, alongside v3):
+
+```sh
+# Same 09:12 start as v3 runners; daemon exits at 15:30 on its own
+12  9  * * 1-5  cd /path/to/hawala && nohup caffeinate -i python3 -m alerts.vp_live_daemon --mode daemon > /dev/null 2>&1 &
+```
+
+Also add to the defensive pkill line:
+
+```sh
+30  3  * * 1-5  pkill -f "runner_nifty.py"; pkill -f "runner_banknifty.py"; \
+                pkill -f "alert_runner.py"; pkill -f "news\.runner"; \
+                pkill -f "alerts.vp_live_daemon"
+```
+
 Optional add-ons (NOT currently scheduled):
 
 ```sh
 # Mid-day + EOD MACRO briefs (in addition to the 07:32 newsletter)
 0  12  * * 1-5  cd /path/to/hawala && python3 -m bots.macro_bot --mode midday
 0  16  * * 1-5  cd /path/to/hawala && python3 -m bots.macro_bot --mode eod
-
-# v2 VP-Trail signal daemon (TRADE bot, alongside v3)
-12  9  * * 1-5  cd /path/to/hawala && nohup caffeinate -i python3 -m alerts.vp_live_daemon --mode daemon > /dev/null 2>&1 &
 ```
 
 ## Backtest reproduction

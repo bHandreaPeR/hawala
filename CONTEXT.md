@@ -53,7 +53,7 @@ manual invocation.
 
 ```
 07:32 IST   run_daily_report.py        → MACRO bot   (Newsletter PDF only, no message)
-09:00       news/runner.py             → TRADE bot   (ad-hoc news event alerts)
+09:00       news/runner.py             → MACRO bot   (ad-hoc news event alerts — routed to MACRO from May 14)
 09:12       v3/live/runner_nifty.py    → TRADE bot   (NIFTY option entry/exit)
 09:12       v3/live/runner_banknifty.py→ TRADE bot   (BANKNIFTY option entry/exit)
 15:30       (runners idle until next day; news runner sleeps)
@@ -111,7 +111,8 @@ hawala-v2/
 │   └── cache_15m/                  — v2 15m cache (used by research)
 │
 ├── alerts/
-│   └── telegram.py                 — IMPORTED by run_daily_report.send_document
+│   ├── telegram.py                 — IMPORTED by run_daily_report.send_document
+│   └── option_flow_daemon.py       — 5-sec strike-level OI flow tracker → MACRO
 │
 ├── daily_report/                   — alt path used by gen_report.build_pdf fallback
 ├── gen_html_report.py              — IMPORTED by run_daily_report
@@ -229,9 +230,10 @@ Chronological summary of significant work. **Append new entries at the bottom.**
 ### Early May — Daily report production
 
 - `run_daily_report.py` is the live morning brief (07:32 IST cron).
-- News scraper (`data/fetch_report_data.py:_fetch_news`) pulls from 8 RSS
-  feeds (Reuters topNews, Reuters business, Google News for Fed/RBI, crypto,
-  geopolitical, oil, India, S&P/Nasdaq) and ships into the PDF.
+- News scraper (`data/fetch_report_data.py:_fetch_news`) pulls from **12
+  trust-whitelisted RSS feeds** (BBC, CNBC, NY Times, ET, Livemint, Hindu
+  BusinessLine, Zerodha Pulse, plus 5 domain-filtered Google News queries
+  restricted to Reuters/Bloomberg/FT/WSJ/AP only) and ships into the PDF.
 - **Output rename (May 10):** PDF now named `Newsletter <DDth Month YY>.pdf`
   (e.g. `Newsletter_13th May 26.pdf`). Lands in `data_dumps/newsletters/`.
 - **Routing change (May 10):** sent to MACRO bot only (was TRADE bot). No
@@ -253,6 +255,99 @@ Chronological summary of significant work. **Append new entries at the bottom.**
   on velocity events; `news/backtest/event_attribution.py` measures their
   predictive value.
 
+### May 15 — Option-flow tracker (retail Bookmap analog)
+
+Built strike-level option-OI flow classifier as the closest retail-Indian-
+market approximation to Bookmap's Cumulative Volume Delta. Bookmap itself
+needs TBT (tick-by-tick aggressor) data that isn't available to retail in
+India — but the OI-quadrant classification per strike at 5-second cadence
+yields a similar "who's positioning, on which side" view.
+
+Three new artefacts:
+
+1. **`v3/signals/option_flow.py`** — pure-compute classifier. Per strike
+   per snapshot pair: classify CE/PE into one of 8 positioning states
+   (long_call_build, short_call_cover, etc.), weight by ATM-proximity ×
+   cash value of ΔOI, aggregate into signed net flow. Cumulative through
+   the session = synthetic CVD analog.
+
+2. **`alerts/option_flow_daemon.py`** — polls option chain every 5 sec
+   during market hours for NIFTY + BANKNIFTY. Writes
+   `v3/cache/option_flow_<inst>.json` (consumed by v3 runners) and sends
+   Telegram alerts to MACRO channel on three extreme conditions:
+       'flip'      — CVD crosses zero with conviction
+       'sustained' — 5 consecutive same-direction snapshots
+       'z_high'    — single-snapshot z-score > 2.0
+   Rate-capped: 1 alert per (instrument, direction) per 15 min.
+
+3. **v3 runner confluence hook (opt-in)** — both
+   `runner_nifty.py` and `runner_banknifty.py` now read the flow file
+   when `V3_REQUIRE_OPTION_FLOW_CONFIRM=1` and add a Filter-F6 veto:
+   if v3's signal direction disagrees with the session CVD direction,
+   suppress the entry. **Default OFF** — measure correlation for 2-3
+   weeks before enabling.
+
+To start (manual, or via cron):
+
+```sh
+nohup caffeinate -i python3 -m alerts.option_flow_daemon --mode daemon \
+    > /dev/null 2>&1 &
+```
+
+Cron entry (add to 09:12 IST block):
+
+```cron
+12 9 * * 1-5 cd "/path" && nohup caffeinate -i /opt/anaconda3/bin/python3 -m alerts.option_flow_daemon --mode daemon > /dev/null 2>&1 &
+```
+
+Also add to defensive `pkill` line:
+
+```cron
+30 3 * * 1-5 ... ; pkill -f "alerts.option_flow_daemon"
+```
+
+### May 14-15 — News pipeline cleanup
+
+Three rounds of work on `news/`:
+
+1. **Routing fix (May 14)** — `news/dispatcher.py` was reading
+   `TELEGRAM_BOT_TOKEN` (TRADE bot) for news alerts. Changed to prefer
+   `TELEGRAM_BOT_TOKEN_MACRO` with fallback. TRADE channel now reserved
+   strictly for entries/exits/P&L.
+
+2. **Noise reduction (May 14)** — alerts/day was 40–45 and felt spammy.
+   Added five layers:
+   - Raised gates: `NEWS_ALERT_SCORE_MIN` 0.4→0.60, `NEWS_ALERT_CONF_MIN`
+     0.6→0.70, `TIER1_FASTPATH_SCORE_MIN` 0.5→0.70
+   - Per-hour cap (4), per-day cap (12), theme-cooldown (120 min) added
+     to `dispatcher.maybe_alert`. State in `news/state/theme_alerted.json`.
+   - Anchor-token gate in `normalize.event_key()` — keys without a token
+     from `ANCHOR_TOKENS` (97 words) return `_NO_ANCHOR_` sentinel.
+     Compound-token preserver (`S&P`, `L&T`, `M&A`) so well-known
+     compounds survive tokenization.
+   - EOD digest (`news/digest.py`) — items hitting gates/caps land here
+     instead of being silently dropped, emitted as one MACRO message at
+     market close.
+   - Expected outcome: ~10 live alerts/day + 1 digest message.
+
+3. **Source expansion + trust cleanup (May 15)** — feed list grew from
+   32 → 47 then trimmed to 44:
+   - **Added 11 feeds**: Zerodha Pulse, BSE filings, SEBI press, CNBC
+     TV18, Hindu BusinessLine + economy, and 5 X-handles via Nitter
+     (NSEIndia, BSEIndia, RBI, CNBCTV18Live, LiveSquawk).
+   - **Removed 3 feeds for partisan/fake-news risk**: Truth Social
+     (Trump posts), broad GN: breaking-30m and GN: india-30m searches
+     (clickbait magnets).
+   - **Tightened 4 feeds**: GN topical searches (rates/geopolitics/oil/
+     india) now use `site:` filters to restrict to Reuters/Bloomberg/FT/
+     WSJ/AP/CNBC/BBC and trusted Indian wires. Tier raised 0.4 → 0.5.
+   - Applied the same cleanup to `data/fetch_report_data.py:_NEWS_FEEDS`
+     (the newsletter PDF feed list) — went from 11 mixed-trust feeds to
+     12 trust-whitelisted feeds with `site:` filters.
+   - Kept Al Jazeera + NDTV Profit per user decision (Al Jazeera is
+     state-funded with Middle East slant but editorially professional;
+     NDTV Profit's Adani ownership flagged but retained).
+
 ### May 10 — Repo consolidation (this commit)
 
 - Created `archived/`, `adhoc/`, `data_dumps/`, `logs/`, `ops/` top-level dirs.
@@ -267,6 +362,43 @@ Chronological summary of significant work. **Append new entries at the bottom.**
   - `v3/live/runner_banknifty.py` → `logs/trade_bot/runner_banknifty.log`
   - Existing log files copied as snapshots into `logs/` subdirs.
 - Wrote this CONTEXT.md as the master reference.
+
+## 6b. News source policy (May 2026)
+
+Authoritative rules for what can appear in `news/sources.py:FEEDS` and
+`data/fetch_report_data.py:_NEWS_FEEDS`:
+
+**Allowed:**
+- Wire services with editorial standards (Reuters, Bloomberg, AP, Axios,
+  ForexLive)
+- Broadsheet papers (FT, WSJ, NY Times, BBC, Hindu BusinessLine, ET,
+  Livemint)
+- Primary government / regulator sources (Fed press, RBI, SEBI, NSE
+  filings, BSE filings)
+- Official institutional X/Twitter accounts (@NSEIndia, @BSEIndia, @RBI)
+- Headline-mirror X/Twitter accounts that re-tweet wire content without
+  editorializing (@DeItaone, @FirstSquawk, @LiveSquawk, @CNBCTV18Live)
+- Curated aggregators that source from the above (Zerodha Pulse)
+- Google News searches **only when** restricted with `site:` filters to
+  the above list
+
+**Disallowed:**
+- Personal-brand social media (Truth Social — Trump posts directly, plus
+  any future similar feeds)
+- Clickbait magnets (`q=breaking OR exclusive` style queries)
+- Partisan blogs of any political alignment
+- Unverified aggregators (Zerohedge, retail-trader sentiment accounts)
+- Crypto-only media (low signal-to-noise for India equity)
+
+**Borderline kept (with caveats):**
+- Al Jazeera — state-funded, Middle East perspective. Editorially
+  professional. Kept for early signal on Middle East events.
+- NDTV Profit — Adani-owned since 2023. Editorial independence flagged
+  but retained for India business coverage.
+
+**Reviewing this list:** if a feed is reported as misleading or partisan,
+the procedure is: (1) remove from the relevant `FEEDS` / `_NEWS_FEEDS`
+list, (2) restart `news.runner`, (3) note the removal in this section.
 
 ## 7. What's been **rejected** (don't rebuild these)
 

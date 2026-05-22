@@ -86,6 +86,7 @@ from v3.signals.fii_dii_classifier_COMBINED import (
     THRESHOLDS_FILE    as THRESHOLDS_COMBINED,
 )
 from alerts.telegram import send as _tg_send
+from v3.live.flow_conflict import FlowConflictTracker, evaluate as _fc_evaluate
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BN_LOT         = 30
@@ -105,6 +106,31 @@ TRAIL_LOCK_PCT     = 0.15   # once activated, exit if profit drops below 15%
 # Signal quality thresholds (match backtest)
 MIN_SIGNAL_COUNT = 5    # minimum signals that must agree before entering (out of 6)
 MOMENTUM_BARS    = 30   # price must trend in signal direction for last 30 bars
+
+# Option-flow confluence (opt-in, env-gated — see runner_nifty.py for details)
+import os as _os
+REQUIRE_OPTION_FLOW_CONFIRM = _os.environ.get("V3_REQUIRE_OPTION_FLOW_CONFIRM",
+                                               "0").lower() in ("1", "true", "yes")
+OPTION_FLOW_MAX_AGE_SEC = 60
+
+
+def _read_option_flow_direction(inst: str) -> int:
+    """Mirror of runner_nifty._read_option_flow_direction."""
+    import json as _json
+    from datetime import datetime as _dt
+    try:
+        p = ROOT / 'v3' / 'cache' / f'option_flow_{inst}.json'
+        if not p.exists():
+            return 0
+        d = _json.loads(p.read_text())
+        ts = _dt.fromisoformat(d.get('ts', ''))
+        age = (_dt.now(ts.tzinfo) - ts).total_seconds() if ts.tzinfo else 9999
+        if age > OPTION_FLOW_MAX_AGE_SEC:
+            return 0
+        cvd = float(d.get('cvd', 0.0))
+        return +1 if cvd > 0 else (-1 if cvd < 0 else 0)
+    except Exception:
+        return 0
 
 # Reversal check interval (bars)
 REVERSAL_CHECK_EVERY = 5
@@ -126,10 +152,23 @@ def _get_groww():
             if '=' in line:
                 k, _, v = line.strip().partition('=')
                 env[k] = v
-    totp  = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
-    token = GrowwAPI.get_access_token(api_key=env['GROWW_API_KEY'], totp=totp)
-    log.info("Groww auth OK")
-    return GrowwAPI(token=token)
+    totp = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
+    # 3-try retry with 5s backoff — transient Groww error at boot
+    # used to kill the session (May 11 + May 15 crashes).
+    last_err = None
+    for attempt in range(3):
+        try:
+            token = GrowwAPI.get_access_token(api_key=env['GROWW_API_KEY'], totp=totp)
+            log.info("Groww auth OK (attempt %d)", attempt + 1)
+            return GrowwAPI(token=token)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                log.warning("Groww auth attempt %d failed, retry 5s: %s", attempt + 1, e)
+                import time as _t; _t.sleep(5)
+                totp = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
+    log.error("Groww auth failed after 3 attempts: %s", last_err)
+    raise last_err
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -318,6 +357,7 @@ def _fmt_exit_alert(
         'TP':       '🎯 Take Profit hit (+100%)',
         'EOD':      '🕥 EOD exit (15:20)',
         'REVERSAL': '🔄 Signal reversal',
+        'FLOW_SL':  '🔴 Flow-conflict premature stop (L3)',
     }
     reason_str = reason_map.get(exit_reason, exit_reason)
 
@@ -1258,6 +1298,7 @@ def run(paper: bool = True):
     bars_in_position: int      = 0
     max_pnl_pct: float         = 0.0
     trail_activated: bool      = False
+    flow_tracker: Optional[FlowConflictTracker] = None   # flow-conflict exit assist
 
     # Per-minute OI snapshot accumulator → written to option_oi_1m_BANKNIFTY.pkl
     # {strike: {'CE': [(ts, close, volume, oi)], 'PE': [...]}}
@@ -1547,6 +1588,16 @@ def run(paper: bool = True):
                 state.signal_count, MIN_SIGNAL_COUNT,
             )
 
+        # F6: option-flow confluence (env-gated, default off)
+        if REQUIRE_OPTION_FLOW_CONFIRM and effective_dir != 0:
+            _flow_dir = _read_option_flow_direction('BANKNIFTY')
+            if _flow_dir != 0 and _flow_dir != effective_dir:
+                log.info(
+                    "Filter OPTION_FLOW: flow_dir=%+d disagrees with effective_dir=%+d → suppress",
+                    _flow_dir, effective_dir,
+                )
+                effective_dir = 0
+
         # No-intraday suppression: mirrors backtest logic.
         # If OI velocity is empty AND FII/DII classifier has no result,
         # the two most informative real-time signals are blind — suppress entry.
@@ -1612,6 +1663,7 @@ def run(paper: bool = True):
             }
             max_pnl_pct     = 0.0
             trail_activated = False
+            flow_tracker    = FlowConflictTracker()
 
             log.info(
                 "[%s] ENTER BN %s BUY  strike=%d @ %.2f  qty=%d  "
@@ -1690,6 +1742,39 @@ def run(paper: bool = True):
                 'ON' if trail_activated else 'off', max_pnl_pct * 100,
             )
 
+            # ── Flow-Conflict Exit Assist (L1/L2/L3) ──────────────────────────
+            fc = _fc_evaluate('BANKNIFTY', position['direction'], pnl_pct,
+                              flow_tracker)
+            if fc is not None:
+                log.info(
+                    "[FLOW-CONFLICT L%d] %s conviction=%+.2f band=%+d "
+                    "consec=%d pnl=%.1f%% force_exit=%s",
+                    fc['level'], fc['action'], fc['conviction'], fc['band'],
+                    fc['consec'], pnl_pct * 100, fc['force_exit'],
+                )
+                _tg_broadcast(tg_token, tg_chats, fc['message'])
+                if fc['force_exit']:
+                    exit_reason = 'FLOW_SL'
+                    result_str  = 'WIN' if pnl_pts > 0 else 'LOSS'
+                    log.info(
+                        "[EXIT FLOW_SL] %s BN %s strike=%d  entry=%.2f  "
+                        "exit=%.2f  pnl=%.2f pts (%.1f%%)  ₹%.0f",
+                        'PAPER' if paper else 'LIVE', side, strike, entry_px,
+                        current_ltp, pnl_pts, pnl_pct * 100, pnl_inr,
+                    )
+                    exit_msg = _fmt_exit_alert(
+                        position, float(current_ltp), exit_reason,
+                        pnl_pts, pnl_inr, paper,
+                    )
+                    _tg_broadcast(tg_token, tg_chats, exit_msg)
+                    position         = None
+                    bars_in_position = 0
+                    max_pnl_pct      = 0.0
+                    trail_activated  = False
+                    flow_tracker     = None
+                    time.sleep(60)
+                    continue
+
             # SL / TP / Trailing stop
             sl_hit    = pnl_pct <= SL_PCT
             tp_hit    = pnl_pct >= TP_PCT
@@ -1715,6 +1800,7 @@ def run(paper: bool = True):
                 bars_in_position = 0
                 max_pnl_pct     = 0.0
                 trail_activated = False
+                flow_tracker    = None
                 time.sleep(60)
                 continue
 
@@ -1738,6 +1824,7 @@ def run(paper: bool = True):
                     bars_in_position = 0
                     max_pnl_pct     = 0.0
                     trail_activated = False
+                    flow_tracker    = None
                     time.sleep(60)
                     continue
 
@@ -1761,6 +1848,7 @@ def run(paper: bool = True):
                 bars_in_position = 0
                 max_pnl_pct     = 0.0
                 trail_activated = False
+                flow_tracker    = None
                 break
 
         # Idle — wait for next minute

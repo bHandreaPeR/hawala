@@ -52,18 +52,38 @@ SNAPSHOT_BARS   = 4   # take VA snapshot every N bars (4 × 15m = 1 hour)
 # ── Cache loading ─────────────────────────────────────────────────────────────
 
 def _load_combined(instrument: str) -> pd.DataFrame:
+    """Load 15m candles for an instrument.
+
+    Primary: data/cache_15m/<inst>_combined.pkl (v2 cache, has Contract/Expiry).
+    Fallback: resample v3/cache/candles_1m_<inst>.pkl → 15m when the v2
+    combined cache is absent (main repo doesn't ship it)."""
     f = CACHE_DIR / f'{instrument}_combined.pkl'
-    if not f.exists():
+    if f.exists():
+        with open(f, 'rb') as h:
+            df = pickle.load(h)
+        df = df.rename(columns={
+            'open': 'Open', 'high': 'High', 'low': 'Low',
+            'close': 'Close', 'volume': 'Volume', 'oi': 'Oi',
+            'contract': 'Contract', 'expiry': 'Expiry',
+        })
+        return df.between_time('09:15', '15:30')
+
+    # Fallback — v3 1m cache resampled to 15m
+    v3f = ROOT / 'v3' / 'cache' / f'candles_1m_{instrument}.pkl'
+    if not v3f.exists():
         return pd.DataFrame()
-    with open(f, 'rb') as h:
-        df = pickle.load(h)
-    df = df.rename(columns={
-        'open': 'Open', 'high': 'High', 'low': 'Low',
-        'close': 'Close', 'volume': 'Volume', 'oi': 'Oi',
-        'contract': 'Contract', 'expiry': 'Expiry',
-    })
-    df = df.between_time('09:15', '15:30')
-    return df
+    raw = pickle.load(open(v3f, 'rb'))
+    raw['ts'] = pd.to_datetime(raw['ts'])
+    raw = raw.set_index('ts').sort_index()
+    g = raw.resample('15min', label='right', closed='right')
+    df = pd.DataFrame({
+        'Open':  g['open'].first(),  'High': g['high'].max(),
+        'Low':   g['low'].min(),     'Close': g['close'].last(),
+        'Volume': g['volume'].sum(),
+    }).dropna(subset=['Open'])
+    df['Contract'] = f'{instrument}-FUT'   # synthetic — fallback has no roll info
+    df['Expiry']   = pd.NaT
+    return df.between_time('09:15', '15:30')
 
 
 def _load_trades(instrument: str, prefix: str = 'vpt') -> pd.DataFrame:
@@ -109,6 +129,37 @@ def _load_full_backtest_trades() -> pd.DataFrame:
         lambda r: 'OOS' if pd.Timestamp(r['date']) >= pd.Timestamp('2026-01-01')
                        else 'IS', axis=1)
     return out
+
+
+def _load_mother_baby_trades(tf: str = '15m') -> pd.DataFrame:
+    """Load mother-baby inside-bar backtest trades for a timeframe (NIFTY only).
+    Prefers the v2 strict single-baby file; falls back to v1 if absent."""
+    f_v2 = TRADE_DIR / f'mother_baby_v2_NIFTY_{tf}.csv'
+    f_v1 = TRADE_DIR / f'mother_baby_NIFTY_{tf}.csv'
+    f = f_v2 if f_v2.exists() else f_v1
+    if not f.exists():
+        return pd.DataFrame()
+    d = pd.read_csv(f)
+    # v2 has a single `baby_ts` (one baby); v1 has baby_ts_first/last.
+    # Normalise so the overlay code path works for both.
+    if 'baby_ts' in d.columns and 'baby_ts_first' not in d.columns:
+        d['baby_ts_first'] = d['baby_ts']
+        d['baby_ts_last']  = d['baby_ts']
+        d['babies']        = 1
+    d['strategy']        = f'MOTHER_BABY_{tf}'
+    d['instrument_name'] = 'NIFTY'
+    d['entry_time']      = pd.to_datetime(d['entry_ts'], errors='coerce')
+    d['exit_time']       = pd.to_datetime(d['exit_ts'],  errors='coerce')
+    d['date']            = pd.to_datetime(d['day']).dt.date
+    d['direction']       = d['side']                    # LONG / SHORT
+    d['exit_price']      = d['exit']
+    d['exit_reason']     = d['reason']
+    d['pnl_pts']         = d['net_pts']
+    d['pnl_rs']          = (d['net_pts'] * 75).round(0)  # NIFTY lot 75
+    # entry/stop/target columns already named entry/stop/target
+    d['period'] = d['entry_time'].apply(
+        lambda t: 'OOS' if pd.notna(t) and t >= pd.Timestamp('2026-01-01') else 'IS')
+    return d
 
 
 def _load_credit_spread_trades() -> pd.DataFrame:
@@ -191,6 +242,34 @@ def _build_simple_dataset(trade: pd.Series, all_data: pd.DataFrame,
             'pnl_rs':      pnl,
             'profile_used': '—',
         },
+        # Mother-Baby overlay — present only when the trade row carries the
+        # mother/baby candle positions (mother_baby_NIFTY_*.csv).
+        'mother_baby': _mother_baby_overlay(trade),
+    }
+
+
+def _mother_baby_overlay(trade: pd.Series) -> dict | None:
+    """Extract mother/baby candle positions for the explorer overlay.
+    Returns None if the trade row has no mother_ts (non-MB strategy)."""
+    m_ts = trade.get('mother_ts')
+    if m_ts is None or (isinstance(m_ts, float) and pd.isna(m_ts)) or str(m_ts) in ('', 'nan', 'NaT'):
+        return None
+    def _iso(v):
+        try:
+            t = pd.Timestamp(v)
+            return t.isoformat() if pd.notna(t) else None
+        except Exception:
+            return None
+    return {
+        'mother_ts':   _iso(m_ts),
+        'mother_high': float(trade.get('mother_high', 0) or 0),
+        'mother_low':  float(trade.get('mother_low', 0) or 0),
+        'baby_first':  _iso(trade.get('baby_ts_first')),
+        'baby_last':   _iso(trade.get('baby_ts_last')),
+        'n_babies':    int(trade.get('babies', 0) or 0),
+        # v2: the baby's high/low ARE the breakout reference levels
+        'baby_high':   float(trade.get('baby_high', 0) or 0) or None,
+        'baby_low':    float(trade.get('baby_low', 0) or 0) or None,
     }
 
 
@@ -665,6 +744,80 @@ function buildLayout(t) {
     });
   }
 
+  // ── Mother-Baby overlay ──────────────────────────────────────────────
+  const mb = t.mother_baby;
+  if (mb && mb.mother_ts) {
+    const mTo = t.trade.entry_ts || mb.mother_ts;   // coil range ends at entry
+    // Mother high / low — the coil range, dashed, mother_ts → entry
+    shapes.push({
+      type: 'line', xref: 'x', yref: 'y',
+      x0: mb.mother_ts, x1: mTo, y0: mb.mother_high, y1: mb.mother_high,
+      line: { color: '#2563eb', dash: 'dash', width: 1.6 },
+    });
+    shapes.push({
+      type: 'line', xref: 'x', yref: 'y',
+      x0: mb.mother_ts, x1: mTo, y0: mb.mother_low, y1: mb.mother_low,
+      line: { color: '#2563eb', dash: 'dash', width: 1.6 },
+    });
+    // Mother candle highlight — amber vertical band
+    shapes.push({
+      type: 'rect', xref: 'x', yref: 'paper',
+      x0: mb.mother_ts, x1: mb.mother_ts, y0: 0, y1: 1,
+      line: { color: '#f59e0b', width: 8 }, opacity: 0.55,
+    });
+    annotations.push({
+      x: mb.mother_ts, y: mb.mother_high, xref: 'x', yref: 'y',
+      text: '<b>MOTHER</b>', showarrow: true, arrowhead: 2, ax: 0, ay: -28,
+      font: { color: '#b45309', size: 12 },
+      arrowcolor: '#f59e0b',
+    });
+    // Baby coil zone — shaded rect baby_first → baby_last × mother range
+    if (mb.baby_first && mb.baby_last) {
+      shapes.push({
+        type: 'rect', xref: 'x', yref: 'y',
+        x0: mb.baby_first, x1: mb.baby_last,
+        y0: mb.mother_low, y1: mb.mother_high,
+        fillcolor: 'rgba(16,185,129,0.14)',
+        line: { color: '#10b981', width: 1, dash: 'dot' }, layer: 'below',
+      });
+      annotations.push({
+        x: mb.baby_last, y: mb.mother_low, xref: 'x', yref: 'y',
+        text: `<b>BABY ×${mb.n_babies}</b>`, showarrow: true, arrowhead: 2,
+        ax: 0, ay: 26, font: { color: '#047857', size: 11 },
+        arrowcolor: '#10b981',
+      });
+    }
+    // v2: baby's high/low ARE the breakout reference — solid green lines
+    // from the baby out to the entry point.
+    const mEnd = t.trade.entry_ts || mb.baby_last || mb.mother_ts;
+    if (mb.baby_high) {
+      shapes.push({
+        type: 'line', xref: 'x', yref: 'y',
+        x0: mb.baby_first || mb.mother_ts, x1: mEnd,
+        y0: mb.baby_high, y1: mb.baby_high,
+        line: { color: '#059669', width: 1.4 },
+      });
+      annotations.push({
+        x: mEnd, y: mb.baby_high, xref: 'x', yref: 'y',
+        text: 'baby high (break ↑)', showarrow: false,
+        font: { color: '#059669', size: 10 }, xanchor: 'right', yshift: 7,
+      });
+    }
+    if (mb.baby_low) {
+      shapes.push({
+        type: 'line', xref: 'x', yref: 'y',
+        x0: mb.baby_first || mb.mother_ts, x1: mEnd,
+        y0: mb.baby_low, y1: mb.baby_low,
+        line: { color: '#059669', width: 1.4 },
+      });
+      annotations.push({
+        x: mEnd, y: mb.baby_low, xref: 'x', yref: 'y',
+        text: 'baby low (break ↓)', showarrow: false,
+        font: { color: '#059669', size: 10 }, xanchor: 'right', yshift: -7,
+      });
+    }
+  }
+
   // Vertical line at the contract expiry (= last candle in the window)
   if (t.candles && t.candles.ts.length) {
     const expiry_ts = t.candles.ts[t.candles.ts.length - 1];
@@ -793,7 +946,8 @@ def main() -> None:
     ap.add_argument('--prefix', default='vpt_final',
                     help='VP-Trail prefix (vpt_final = canonical realistic-'
                          'slippage run)')
-    ap.add_argument('--strategies', default='VP_TRAIL,ORB,OPT_ORB,VWAP_REV,CREDIT_SPREAD',
+    ap.add_argument('--strategies',
+                    default='VP_TRAIL,ORB,OPT_ORB,VWAP_REV,CREDIT_SPREAD,MOTHER_BABY_15M',
                     help='comma-separated strategies to include')
     ap.add_argument('--out', default=None)
     args = ap.parse_args()
@@ -835,6 +989,11 @@ def main() -> None:
         sp = _load_credit_spread_trades()
         for _, r in sp.iterrows():
             rows.append(('CREDIT_SPREAD', r))
+
+    if 'MOTHER_BABY_15M' in want:
+        mb = _load_mother_baby_trades('15m')
+        for _, r in mb.iterrows():
+            rows.append(('MOTHER_BABY_15M', r))
 
     # ── Filter ────────────────────────────────────────────────────────────
     if args.filter:

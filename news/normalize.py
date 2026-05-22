@@ -32,11 +32,65 @@ _WS_RE     = re.compile(r"\s+")
 _TOKEN_RE  = re.compile(r"[a-z0-9$%]+")
 
 
+# ── Anchor vocabulary (May 2026 cleanup) ─────────────────────────────────────
+# An event_key MUST contain at least one of these tokens to be considered
+# well-formed. Headlines that produce fragment-only keys like
+# `cards_doesn_iran_learns_trump` (40% of historic alerted keys) are usually
+# noise; this gate rejects them at the source.
+#
+# Vocabulary sources: keywords.yml triggers + entities + tier-1 macro proper nouns.
+ANCHOR_TOKENS = frozenset({
+    # monetary policy
+    'fed','fomc','powell','rbi','mpc','ecb','boj','boe','rate','rates',
+    'cpi','inflation','repo',
+    # geopolitical actors / themes
+    'iran','israel','russia','ukraine','china','korea','hormuz','gaza',
+    'taiwan','war','strike','strikes','sanctions','tariff','tariffs',
+    'ceasefire','peace','nuclear','missile','trump','biden','putin','xi','modi',
+    # commodities
+    'oil','crude','brent','wti','opec','gas','gold',
+    # india macro
+    'india','nifty','sensex','banknifty','rupee','fii','dii','monsoon',
+    'sebi','gst','gdp','rating','moody','fitch',
+    'nse','bse','exchange','circular','probe','fine','penalty',
+    'agm','qip','buyback','dividend','results','earnings',
+    # crisis / markets
+    'default','bankrupt','crisis','collapse','crash','rout',
+    'sp500','nasdaq','dow','yen','dollar','treasury','vix',
+    # corporate megacap (matches keywords.yml entities)
+    'reliance','hdfc','icici','sbi','infosys','tcs','bharti','kotak',
+    'axis','larsen','itc','bajaj','maruti',
+})
+
+# Sentinel returned by event_key() when no anchor is present.
+NO_ANCHOR = "_NO_ANCHOR_"
+
+
+def is_valid_event_key(event_key: str) -> bool:
+    """Reject event_keys with no anchor token (= probably a fragment)."""
+    if not event_key or event_key == NO_ANCHOR:
+        return False
+    return bool(set(event_key.split('_')) & ANCHOR_TOKENS)
+
+
+# Compound-token pre-normalization — protect well-known indices/tickers
+# from being shredded by the punctuation-stripping regex below.
+_COMPOUND_FIXUPS = [
+    (re.compile(r"\bs\s*&\s*p\s*500\b",  re.I), "sp500"),
+    (re.compile(r"\bs\s*&\s*p\b",        re.I), "sp500"),
+    (re.compile(r"\bdow\s+jones\b",      re.I), "dow"),
+    (re.compile(r"\bl\s*&\s*t\b",        re.I), "larsen"),
+    (re.compile(r"\bm\s*&\s*a\b",        re.I), "mergers"),
+]
+
+
 def normalize(text: str) -> str:
     """Lowercase, strip punctuation (except $ % which carry meaning), collapse whitespace."""
     if not text:
         return ""
     s = text.lower()
+    for pat, rep in _COMPOUND_FIXUPS:
+        s = pat.sub(rep, s)
     # Keep $ and % since they signal price levels and figures
     s = re.sub(r"[^\w\s$%]+", " ", s)
     s = _WS_RE.sub(" ", s).strip()
@@ -44,10 +98,11 @@ def normalize(text: str) -> str:
 
 
 def tokens(text: str) -> list[str]:
-    """Tokenize a normalized string into a list of tokens (preserves order, keeps $ %)."""
+    """Tokenize a normalized string into a list of tokens (preserves order, keeps $ %).
+    Routes through normalize() first so compound tokens (S&P → sp500, L&T → larsen) survive."""
     if not text:
         return []
-    return _TOKEN_RE.findall(text.lower())
+    return _TOKEN_RE.findall(normalize(text))
 
 
 def content_tokens(text: str) -> list[str]:
@@ -87,7 +142,11 @@ def event_key(text: str, k: int = 5) -> str:
     # Drop the most generic — markets, says, today — already handled by stopwords;
     # for now, just take first K (they're in headline order, which weighs the lead).
     chosen = sorted(out[:k])
-    return "_".join(chosen)
+    key = "_".join(chosen)
+    # Anchor gate — fragment-only keys are routed to digest, not live alerts.
+    if not is_valid_event_key(key):
+        return NO_ANCHOR
+    return key
 
 
 def jaccard(a: set[str], b: set[str]) -> float:

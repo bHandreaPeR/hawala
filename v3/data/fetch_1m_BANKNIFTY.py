@@ -226,6 +226,10 @@ def fetch_and_cache(start_date: date = None, lookback_days: int = 120,
             continue
         if d > today:
             continue
+        # Skip today pre-market (Groww rejects future timestamps)
+        from datetime import datetime as _dt, time as _tm
+        if d == today and _dt.now().time() < _tm(15, 30):
+            continue
 
         log.info("Fetching BANKNIFTY 1m %s ...", d)
         try:

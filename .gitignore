@@ -1,43 +1,73 @@
-# ── Secrets — NEVER commit these ──────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# Hawala v2 — .gitignore
+# Last reviewed: 2026-05-23 (pre-Windows migration)
+# ──────────────────────────────────────────────────────────────
+
+# ── Secrets — NEVER COMMIT ─────────────────────────────────────
 .github_token
 *.token
 *.secret
 .env
 .env.*
+token.env
+token.env.rtf
+google-backup-codes-*.txt
+*backup-codes*
 
-# ── Generated outputs ──────────────────────────────────────────
+# ── Generated outputs (regeneratable) ─────────────────────────
 market_report_*.pdf
 market_report_*.html
 market_signal_*.json
 data_*.json
+Newsletter*.pdf
+Newsletter*.html
+data_dumps/
 
-# ── Cached data files ──────────────────────────────────────────
+# ── Large historical archives (>100MB total, regeneratable) ──
+Reports-Daily-Multiple/
+fii_stats_*.xls
+fii_stats_*.xlsx
+*.xls
+*.xlsx
+
+# ── Cached data files (regeneratable via fetchers) ─────────────
 fii_data.csv
 __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
 
+# ── 1m / OI / depth / tick / footprint caches ─────────────────
+v3/cache/*.pkl
+*.pkl
+v3/cache/*.json
+v3/cache/*.csv
+v3/cache/*.ndjson
+v3/cache/*.parquet
+trade_logs/ticks_*.csv
+trade_logs/depth_*.csv
+trade_logs/*.parquet
+
+# ── Daemon state (runtime — regenerates) ──────────────────────
+alerts/.*.json
+news/state/*.json
+news/*.pid
+news/state/*.pid
+
 # ── OS / Editor ────────────────────────────────────────────────
 .DS_Store
 .idea/
 .vscode/
 *.swp
-
-# ── Secrets ─────────────────────────────────────────────────────
-token.env
-token.env.rtf
-
-# ── Cache / binary data (too large for git) ──────────────────────
-v3/cache/*.pkl
-*.pkl
+.claude/worktrees/
 
 # ── Live runner logs ────────────────────────────────────────────
 v3/live/runner.log
 v3/live/runner_banknifty.log
 *.log
+logs/
 
-# ── NSE data files ──────────────────────────────────────────────
+# ── NSE data files (raw bhavcopy, rarely useful in git) ───────
 *.spn
 nsccl.*
 *.zip
@@ -47,3 +77,7 @@ nsccl.*
 anaconda_projects/
 combineoi_*/
 -f
+
+# ── Generated HTML viewers / footprint outputs ────────────────
+research/footprint_*_*.html
+research/trade_explorer.html

@@ -30,20 +30,30 @@ log = logging.getLogger("news.dispatcher")
 ROOT = Path(__file__).resolve().parent.parent
 SIGNAL_PATH = ROOT / "v3" / "cache" / "news_signal.json"
 
-ALERT_SCORE_MIN = float(os.environ.get("NEWS_ALERT_SCORE_MIN", "0.4"))
-ALERT_CONF_MIN  = float(os.environ.get("NEWS_ALERT_CONF_MIN",  "0.6"))
+ALERT_SCORE_MIN = float(os.environ.get("NEWS_ALERT_SCORE_MIN", "0.60"))
+ALERT_CONF_MIN  = float(os.environ.get("NEWS_ALERT_CONF_MIN",  "0.70"))
 
 # Tier-1 fast-path: when the top headline is from a Tier-1 source (Reuters,
 # Bloomberg, FT, WSJ, Axios, Moneycontrol breaking, RBI), waiting for
 # corroboration from Tier-2/3 is too slow. A Tier-1 single source carrying a
 # strong score IS the alert. These thresholds gate this fast path.
-TIER1_FASTPATH_SCORE_MIN = float(os.environ.get("NEWS_T1_SCORE_MIN", "0.5"))
+TIER1_FASTPATH_SCORE_MIN = float(os.environ.get("NEWS_T1_SCORE_MIN", "0.70"))
 TIER1_MIN_TIER           = float(os.environ.get("NEWS_T1_MIN_TIER",  "1.0"))
+
+# Rate caps (May 2026 cleanup) — when a cap fires, the item is buffered
+# for the EOD digest, not silently dropped.
+NEWS_MAX_PER_HOUR       = int(os.environ.get("NEWS_MAX_PER_HOUR",       "4"))
+NEWS_MAX_PER_DAY        = int(os.environ.get("NEWS_MAX_PER_DAY",       "12"))
+NEWS_THEME_COOLDOWN_MIN = int(os.environ.get("NEWS_THEME_COOLDOWN_MIN","120"))
+
+# Theme cooldown state (separate from event_key dedup)
+THEME_ALERTED_PATH = ROOT / "news" / "state" / "theme_alerted.json"
 
 
 # ── Telegram config ──────────────────────────────────────────────────────────
 def _load_telegram_config() -> tuple[str, list[str]]:
-    """Mirror of v3 runner's _load_telegram_config."""
+    """News alerts → MACRO channel (context, not trade signals).
+    Falls back to TRADE bot if MACRO tokens missing."""
     env_path = ROOT / "token.env"
     if not env_path.exists():
         return "", []
@@ -54,8 +64,11 @@ def _load_telegram_config() -> tuple[str, list[str]]:
             if "=" in line and not line.startswith("#"):
                 k, _, v = line.partition("=")
                 env[k.strip()] = v.strip()
-    token    = env.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_raw = env.get("TELEGRAM_CHAT_IDS", env.get("TELEGRAM_CHAT_ID", "")).strip()
+    # Prefer MACRO bot for news (architectural rule: TRADE = entries/exits only)
+    token    = (env.get("TELEGRAM_BOT_TOKEN_MACRO", "").strip()
+                or env.get("TELEGRAM_BOT_TOKEN", "").strip())
+    chat_raw = (env.get("TELEGRAM_CHAT_IDS_MACRO", "").strip()
+                or env.get("TELEGRAM_CHAT_IDS", env.get("TELEGRAM_CHAT_ID", "")).strip())
     chats = [c.strip() for c in chat_raw.split(",") if c.strip()]
     return token, chats
 
@@ -242,6 +255,81 @@ def format_alert(global_agg: dict, v3_state: dict) -> str:
     return "\n".join(parts)
 
 
+# ── Rate-cap helpers (May 2026 cleanup) ──────────────────────────────────────
+def _now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def _alerted_records() -> list[dict]:
+    """All records from alerted.json with normalised ts."""
+    from . import dedup as _d
+    a = _d._load(_d.ALERTED_PATH)
+    out = []
+    for ek, rec in a.items():
+        if isinstance(rec, dict) and rec.get("ts"):
+            try:
+                out.append({"event_key": ek,
+                            "ts": datetime.fromisoformat(rec["ts"]),
+                            "direction": int(rec.get("direction", 0))})
+            except Exception:
+                continue
+    return out
+
+
+def _count_alerts_in_window(minutes: int | None = None,
+                            today_only: bool = False) -> int:
+    """Count alerts from alerted.json within last <minutes> or today (IST)."""
+    recs = _alerted_records()
+    now = _now_ist()
+    if minutes is not None:
+        cutoff = now - timedelta(minutes=minutes)
+        return sum(1 for r in recs if r["ts"] >= cutoff)
+    if today_only:
+        today = now.date()
+        return sum(1 for r in recs if r["ts"].date() == today)
+    return len(recs)
+
+
+def _theme_key(event_key: str) -> str | None:
+    """First two anchor tokens (sorted) — used as a coarse theme guard."""
+    from .normalize import ANCHOR_TOKENS
+    tokens = [t for t in event_key.split("_") if t in ANCHOR_TOKENS]
+    if not tokens:
+        return None
+    tokens = sorted(set(tokens))[:2]
+    return "_".join(tokens)
+
+
+def _theme_alerted_recently(theme: str, cooldown_min: int) -> bool:
+    if not theme:
+        return False
+    from . import dedup as _d
+    data = _d._load(THEME_ALERTED_PATH) if THEME_ALERTED_PATH.exists() else {}
+    rec = data.get(theme)
+    if not rec:
+        return False
+    try:
+        ts = datetime.fromisoformat(rec.get("ts", ""))
+    except Exception:
+        return False
+    return (_now_ist() - ts) < timedelta(minutes=cooldown_min)
+
+
+def _mark_theme_alerted(theme: str) -> None:
+    if not theme:
+        return
+    from . import dedup as _d
+    THEME_ALERTED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data = _d._load(THEME_ALERTED_PATH) if THEME_ALERTED_PATH.exists() else {}
+    # Prune entries older than 24h
+    cutoff = _now_ist() - timedelta(hours=24)
+    data = {k: v for k, v in data.items()
+            if isinstance(v, dict) and v.get("ts")
+            and datetime.fromisoformat(v["ts"]) >= cutoff}
+    data[theme] = {"ts": _now_ist().isoformat()}
+    _d._save(THEME_ALERTED_PATH, data)
+
+
 # ── Main entrypoint ──────────────────────────────────────────────────────────
 def maybe_alert(global_agg: dict, v3_state: dict, force: bool = False) -> bool:
     """If thresholds are met and event_key not yet alerted, broadcast.
@@ -292,10 +380,64 @@ def maybe_alert(global_agg: dict, v3_state: dict, force: bool = False) -> bool:
         anchor = (top.get("top") or {}).get("headline", "")
         event_key = N.event_key(anchor) or N.headline_hash(anchor)[:16]
 
+    # Anchor-word gate — _NO_ANCHOR_ marker means the event_key has no
+    # recognisable topic anchor (probably a fragmented headline). Route to
+    # digest so it isn't silently lost.
+    from .normalize import NO_ANCHOR
+    if event_key == NO_ANCHOR or event_key.startswith(NO_ANCHOR):
+        if not force:
+            try:
+                from . import digest as _digest
+                _digest.add({
+                    "event_key": event_key,
+                    "score":     score_raw,
+                    "confidence": conf,
+                    "direction": agg_dir,
+                    "headline":  (top.get("top") or {}).get("headline", ""),
+                    "source":    (top.get("top") or {}).get("source", ""),
+                    "ts":        _now_ist().isoformat(),
+                }, reason="no_anchor")
+            except Exception as e:
+                log.warning("digest.add (no_anchor) failed: %s", e)
+        return False
+
     # Direction-aware suppression — if the same event_key already alerted but
     # the news direction has FLIPPED since, allow the re-alert.
     if not force and dedup.already_alerted(event_key, direction=agg_dir):
         return False
+
+    # ── Rate-cap gates (route capped items to EOD digest) ─────────────────
+    def _to_digest(reason: str) -> bool:
+        try:
+            from . import digest as _digest
+            _digest.add({
+                "event_key": event_key,
+                "score":     float(global_agg.get("score", 0.0)),
+                "confidence": conf,
+                "direction": agg_dir,
+                "headline":  (top.get("top") or {}).get("headline", ""),
+                "source":    (top.get("top") or {}).get("source", ""),
+                "ts":        _now_ist().isoformat(),
+            }, reason=reason)
+        except Exception as e:
+            log.warning("digest.add failed: %s", e)
+        log.info("capped:%s event_key=%s score=%+.2f dir=%+d → digest",
+                 reason, event_key, score_raw, agg_dir)
+        # Still mark alerted so we don't keep evaluating the same event_key
+        dedup.mark_alerted(event_key, direction=agg_dir)
+        return False
+
+    if not force:
+        # Per-day cap (applies to BOTH paths — even tier-1 fastpath)
+        if _count_alerts_in_window(today_only=True) >= NEWS_MAX_PER_DAY:
+            return _to_digest("day")
+        # Per-hour cap (tier-1 fastpath exempt — flash events still fire)
+        if not tier1_ok and _count_alerts_in_window(minutes=60) >= NEWS_MAX_PER_HOUR:
+            return _to_digest("hour")
+        # Theme cooldown
+        theme = _theme_key(event_key)
+        if theme and _theme_alerted_recently(theme, NEWS_THEME_COOLDOWN_MIN):
+            return _to_digest("theme")
 
     token, chats = _load_telegram_config()
     if not token or not chats:
@@ -306,8 +448,11 @@ def maybe_alert(global_agg: dict, v3_state: dict, force: bool = False) -> bool:
     n = _broadcast(token, chats, msg)
     if n > 0 and not force:
         dedup.mark_alerted(event_key, direction=agg_dir)
-        log.info("Alert sent to %d chat(s) for event_key=%s dir=%+d",
-                 n, event_key, agg_dir)
+        theme = _theme_key(event_key)
+        if theme:
+            _mark_theme_alerted(theme)
+        log.info("Alert sent to %d chat(s) for event_key=%s dir=%+d theme=%s",
+                 n, event_key, agg_dir, theme or "—")
         return True
     return False
 

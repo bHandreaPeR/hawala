@@ -301,32 +301,48 @@ def _html_unescape(text):
     return _html_lib.unescape(text)
 
 
-# Priority RSS sources — each tagged with a default category
-# Reuters feeds (feeds.reuters.com) were shut down — replaced with live alternatives
+# Priority RSS sources — each tagged with a default category.
+# Trust principle (May 2026): only editorially-accountable wires + broad Google
+# News queries restricted to whitelisted domains. Removed:
+#   - bare Google News queries that surfaced any ranking site (clickbait risk)
+# All broad GN searches below now use `site:` filters limiting to Reuters,
+# Bloomberg, FT, WSJ, CNBC, BBC, AP, Moneycontrol, ET, Mint, Hindu BusinessLine.
 _NEWS_FEEDS = [
-    # Tier-1 financial publishers (verified live feeds)
+    # ── Tier-1 direct (verified live feeds) ────────────────────────────────
     ("https://feeds.bbci.co.uk/news/business/rss.xml",                                                                                "global"),
     ("https://www.cnbc.com/id/10000664/device/rss/rss.html",                                                                          "global"),
     ("https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",                                                                     "macro"),
-    ("https://economictimes.indiatimes.com/rssfeedstopstories.cms",                                                                    "india"),
-    ("https://www.livemint.com/rss/markets",                                                                                           "india"),
-    # Targeted Google News queries
-    ("https://news.google.com/rss/search?q=US+federal+reserve+OR+RBI+OR+ECB+interest+rate+OR+central+bank&hl=en&gl=US&ceid=US:en",   "macro"),
-    ("https://news.google.com/rss/search?q=bitcoin+ethereum+crypto+market&hl=en&gl=US&ceid=US:en",                                    "crypto"),
-    ("https://news.google.com/rss/search?q=geopolitical+risk+OR+iran+OR+china+tariff+OR+russia+ukraine+OR+middle+east&hl=en&gl=US&ceid=US:en", "global"),
-    ("https://news.google.com/rss/search?q=oil+crude+opec+brent&hl=en&gl=US&ceid=US:en",                                              "energy"),
-    ("https://news.google.com/rss/search?q=india+RBI+SEBI+nifty+sensex+economy&hl=en-IN&gl=IN&ceid=IN:en",                           "india"),
-    ("https://news.google.com/rss/search?q=S%26P500+nasdaq+dow+jones+wall+street&hl=en&gl=US&ceid=US:en",                            "global"),
+    ("https://economictimes.indiatimes.com/rssfeedstopstories.cms",                                                                   "india"),
+    ("https://www.livemint.com/rss/markets",                                                                                          "india"),
+    ("https://www.thehindubusinessline.com/markets/feeder/default.rss",                                                               "india"),
+    ("https://pulse.zerodha.com/feed.php",                                                                                            "india"),
+
+    # ── Domain-filtered Google News queries (trust-whitelist) ─────────────
+    # Macro / central banks
+    ("https://news.google.com/rss/search?q=(site:reuters.com+OR+site:bloomberg.com+OR+site:ft.com+OR+site:wsj.com+OR+site:cnbc.com+OR+site:apnews.com)+(federal+reserve+OR+rbi+OR+ecb+OR+interest+rate+OR+central+bank)&hl=en&gl=US&ceid=US:en",   "macro"),
+    # Geopolitics (kept narrow + whitelisted)
+    ("https://news.google.com/rss/search?q=(site:reuters.com+OR+site:bloomberg.com+OR+site:ft.com+OR+site:wsj.com+OR+site:apnews.com+OR+site:bbc.com)+(geopolitical+risk+OR+iran+OR+russia+ukraine+OR+china+tariff+OR+middle+east+OR+ceasefire)&hl=en&gl=US&ceid=US:en", "global"),
+    # Oil / energy
+    ("https://news.google.com/rss/search?q=(site:reuters.com+OR+site:bloomberg.com+OR+site:ft.com+OR+site:wsj.com+OR+site:cnbc.com)+(oil+OR+crude+OR+opec+OR+brent)&hl=en&gl=US&ceid=US:en",                            "energy"),
+    # India macro
+    ("https://news.google.com/rss/search?q=(site:reuters.com+OR+site:bloomberg.com+OR+site:moneycontrol.com+OR+site:economictimes.indiatimes.com+OR+site:livemint.com+OR+site:thehindubusinessline.com)+(rbi+OR+sebi+OR+nifty+OR+sensex+OR+india+economy)&hl=en-IN&gl=IN&ceid=IN:en",   "india"),
+    # US indices
+    ("https://news.google.com/rss/search?q=(site:reuters.com+OR+site:bloomberg.com+OR+site:ft.com+OR+site:wsj.com+OR+site:cnbc.com)+(S%26P500+OR+nasdaq+OR+dow+jones)&hl=en&gl=US&ceid=US:en",                          "global"),
+    # Crypto removed — neither a market-mover for our books nor whitelistable
+    # without surfacing low-trust crypto media. If we want it back, scope to
+    # site:reuters.com OR site:bloomberg.com only.
 ]
 
 # Map feed URL prefix → display source name (for the news card)
 _FEED_SOURCE = {
-    "feeds.bbci.co.uk":          "BBC Business",
-    "www.cnbc.com":               "CNBC",
-    "rss.nytimes.com":            "NY Times",
-    "economictimes.indiatimes":   "Economic Times",
-    "www.livemint.com":           "Livemint",
-    "news.google.com":            "Google News",
+    "feeds.bbci.co.uk":            "BBC Business",
+    "www.cnbc.com":                 "CNBC",
+    "rss.nytimes.com":              "NY Times",
+    "economictimes.indiatimes":     "Economic Times",
+    "www.livemint.com":             "Livemint",
+    "www.thehindubusinessline.com": "Hindu BusinessLine",
+    "pulse.zerodha.com":            "Zerodha Pulse",
+    "news.google.com":              "Google News",
 }
 
 # High-signal keywords that boost an item to "must include"
@@ -1022,17 +1038,27 @@ def fetch_all() -> dict:
     bn_analysis   = _fetch_bn_analysis(usdinr)
     nifty_analysis = _fetch_nifty_analysis()
 
-    # GIFT Nifty proxy: use ^NSEI last as base, apply GIFT premium from yf
-    gift_last, gift_prev = _ticker_last("NIFTYBEES.NS")   # ETF proxy if available
+    # GIFT Nifty — REAL value scraped from sgxnifty.org (GIFT City trades
+    # overnight). Replaces the old mislabelled ^NSEI proxy. Falls back to
+    # ^NSEI last close only if the scrape fails.
     gift_nifty_pts = "—"
+    gift_nifty_asof = ""
     try:
-        gift_t = yf.Ticker("^NSEI")
-        gift_hist = gift_t.history(period="2d", interval="60m")
-        if not gift_hist.empty:
-            gift_last_price = round(float(gift_hist["Close"].iloc[-1]), 2)
-            gift_nifty_pts = gift_last_price
-    except:
-        gift_nifty_pts = nifty_analysis.get("prev_close", "—")
+        from data.gift_nifty import get_gift_nifty
+        _gn = get_gift_nifty()
+        if _gn:
+            gift_nifty_pts  = _gn['value']
+            gift_nifty_asof = _gn['asof']
+    except Exception:
+        pass
+    if gift_nifty_pts == "—":
+        # Fallback — old ^NSEI proxy (clearly worse, but better than nothing)
+        try:
+            gift_hist = yf.Ticker("^NSEI").history(period="2d", interval="60m")
+            if not gift_hist.empty:
+                gift_nifty_pts = round(float(gift_hist["Close"].iloc[-1]), 2)
+        except Exception:
+            gift_nifty_pts = nifty_analysis.get("prev_close", "—")
 
     # BN gap estimate: GIFT % × BN prev close
     bn_prev = bn_analysis.get("prev_close", None)
@@ -1086,6 +1112,7 @@ def fetch_all() -> dict:
         "crypto_fg_score":   crypto_fg_score,
         "crypto_fg_label":   crypto_fg_label,
         "gift_nifty":        gift_nifty_pts,
+        "gift_nifty_asof":   gift_nifty_asof,
         "india_markets":     india_markets,
         "india_vix":         india_vix_row,
         "us_markets":        us_markets,

@@ -1,0 +1,196 @@
+"""End-of-day news digest.
+
+Buffers sub-threshold or rate-capped news items during the trading day, then
+emits ONE summary message to the MACRO Telegram channel at 15:30 IST (or on
+demand).
+
+Why this exists: the live alert pipeline is calibrated tight (≤12 alerts/day).
+Items that would have alerted under a looser threshold — or that hit a per-
+hour / per-day / per-theme cap — would otherwise be silently dropped. They
+land here instead so you keep the context without channel spam.
+
+Buffer file: news/state/digest_buffer.json (auto-pruned at midnight IST).
+
+Public surface:
+    add(item, reason)           — append one item during the day
+    emit_eod_digest()           — send + clear (called by runner at 15:30)
+    pending_count() -> int      — how many items currently buffered
+
+Reason values used by the dispatcher / runner:
+    'gated'        — below ALERT_SCORE_MIN / ALERT_CONF_MIN
+    'capped:hour'  — per-hour cap exceeded
+    'capped:day'   — per-day cap exceeded
+    'capped:theme' — theme cooldown active
+    'no_anchor'    — event_key failed the anchor-token validator
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from .dedup import IST, _load, _save
+
+log = logging.getLogger("news.digest")
+
+ROOT = Path(__file__).resolve().parent.parent
+BUFFER_PATH = ROOT / "news" / "state" / "digest_buffer.json"
+
+
+def _now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def _load_buf() -> list[dict]:
+    if not BUFFER_PATH.exists():
+        return []
+    try:
+        return json.loads(BUFFER_PATH.read_text())
+    except Exception:
+        return []
+
+
+def _save_buf(items: list[dict]) -> None:
+    BUFFER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BUFFER_PATH.write_text(json.dumps(items, indent=2, default=str))
+
+
+def _prune_to_today(items: list[dict]) -> list[dict]:
+    """Drop items from previous days (digest is daily)."""
+    today = _now_ist().date()
+    keep = []
+    for it in items:
+        try:
+            ts = datetime.fromisoformat(it.get("ts", ""))
+            if ts.astimezone(IST).date() == today:
+                keep.append(it)
+        except Exception:
+            continue
+    return keep
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+def add(item: dict, reason: str) -> None:
+    """Append one item to today's digest buffer.
+
+    `item` should carry: event_key, score, confidence, direction, headline,
+    source, ts (ISO). `reason` is one of the documented values above.
+    """
+    buf = _prune_to_today(_load_buf())
+    rec = dict(item)
+    rec["reason"] = reason
+    if "ts" not in rec:
+        rec["ts"] = _now_ist().isoformat()
+    buf.append(rec)
+    _save_buf(buf)
+    log.info("digest.add reason=%s event_key=%s (buffered=%d)",
+             reason, rec.get("event_key", "?"), len(buf))
+
+
+def pending_count() -> int:
+    return len(_prune_to_today(_load_buf()))
+
+
+def _esc(s: str) -> str:
+    import html as _h
+    return _h.escape(str(s or ""))
+
+
+def _format(buf: list[dict]) -> str:
+    """Build the HTML digest message. Groups by direction, shows top items + counts."""
+    now = _now_ist()
+    bulls = [b for b in buf if int(b.get("direction", 0)) > 0]
+    bears = [b for b in buf if int(b.get("direction", 0)) < 0]
+    neutrals = [b for b in buf if int(b.get("direction", 0)) == 0]
+
+    # Sort by |score| desc
+    def _abs(it):
+        try:
+            return abs(float(it.get("score", 0.0)))
+        except Exception:
+            return 0.0
+    bulls.sort(key=_abs, reverse=True)
+    bears.sort(key=_abs, reverse=True)
+
+    # Reason histogram
+    reasons: dict[str, int] = {}
+    for it in buf:
+        r = it.get("reason", "?")
+        reasons[r] = reasons.get(r, 0) + 1
+    reason_summary = "  ·  ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
+
+    head = (f"📰 <b>News EOD Digest — {now:%a %d-%b-%Y}</b>\n"
+            f"<i>{len(buf)} items not sent live  ·  {reason_summary}</i>\n")
+
+    def _block(title: str, items: list[dict], emoji: str, take: int = 5) -> str:
+        if not items:
+            return ""
+        parts = [f"\n{emoji} <b>{title}</b> ({len(items)})"]
+        for it in items[:take]:
+            score = float(it.get("score", 0.0))
+            conf = float(it.get("confidence", 0.0))
+            src = it.get("source", "")
+            hl = it.get("headline", "") or it.get("event_key", "")
+            tag = it.get("reason", "")
+            parts.append(
+                f"   • <code>{score:+.2f}</code>/{conf:.2f}  "
+                f"{_esc(hl)[:110]}"
+                f"  <i>[{_esc(src)} · {_esc(tag)}]</i>"
+            )
+        if len(items) > take:
+            parts.append(f"   …and {len(items) - take} more.")
+        return "\n".join(parts)
+
+    body = (_block("Bullish for NIFTY", bulls, "🟢")
+            + _block("Bearish for NIFTY", bears, "🔴")
+            + _block("Neutral / unclassified", neutrals, "⚪"))
+
+    foot = "\n\n<i>Generated by news/digest.py at market close. "\
+           "Live alerts above this threshold went to the channel earlier today.</i>"
+    return head + body + foot
+
+
+def emit_eod_digest() -> bool:
+    """Send a single MACRO message with today's buffered items, then clear.
+
+    Returns True if a message was sent. False if nothing to send or telegram
+    not configured.
+    """
+    buf = _prune_to_today(_load_buf())
+    if not buf:
+        log.info("emit_eod_digest: nothing buffered, skipping")
+        _save_buf([])
+        return False
+
+    # Import lazily to avoid circular import at module load
+    from .dispatcher import _load_telegram_config, _tg_send
+    token, chats = _load_telegram_config()
+    if not token or not chats:
+        log.warning("emit_eod_digest: telegram disabled — %d items pending",
+                    len(buf))
+        return False
+
+    text = _format(buf)
+    sent_any = False
+    for c in chats:
+        if _tg_send(token, c, text):
+            sent_any = True
+
+    if sent_any:
+        log.info("emit_eod_digest: sent (%d items)", len(buf))
+        _save_buf([])    # clear after successful send
+    else:
+        log.warning("emit_eod_digest: all sends failed; buffer retained")
+    return sent_any
+
+
+if __name__ == "__main__":
+    # Manual: python -m news.digest  → emit the current buffer
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if "--count" in sys.argv:
+        print(f"pending: {pending_count()}")
+    else:
+        ok = emit_eod_digest()
+        sys.exit(0 if ok else 1)

@@ -41,30 +41,38 @@ def _get_groww():
 
 
 # ── Contract resolver ─────────────────────────────────────────────────────────
-def _last_thursday(year: int, month: int) -> date:
-    """
-    Return last Thursday of the given month.
-    BSE/NSE monthly futures always expire on the last Thursday.
-    """
+def _last_weekday(year: int, month: int, target_wd: int) -> date:
+    """Return last <target_wd> of (year, month). weekday: Mon=0 … Sun=6."""
     if month == 12:
         last_day = date(year + 1, 1, 1) - timedelta(days=1)
     else:
         last_day = date(year, month + 1, 1) - timedelta(days=1)
-    # weekday 3 = Thursday
-    days_back = (last_day.weekday() - 3) % 7
+    days_back = (last_day.weekday() - target_wd) % 7
     return last_day - timedelta(days=days_back)
 
 
+def _sensex_monthly_expiry(year: int, month: int) -> date:
+    """
+    BSE SENSEX monthly futures expiry:
+      • Last Thursday through April 2026
+      • Last Wednesday from May 2026 onwards (BSE rule change)
+    """
+    if (year, month) >= (2026, 5):
+        return _last_weekday(year, month, 2)   # Wed
+    return _last_weekday(year, month, 3)       # Thu
+
+
+# Back-compat alias — original code used _last_thursday() everywhere
+def _last_thursday(year: int, month: int) -> date:
+    return _sensex_monthly_expiry(year, month)
+
+
 def _get_near_monthly_expiry(trade_date: date) -> date:
-    """
-    Return nearest SENSEX monthly futures expiry (last Thursday) on or after trade_date.
-    Does NOT call get_expiries() — monthly futures expiry = last Thursday,
-    which for Sensex coincides with the last weekly option expiry of the month,
-    but using _last_thursday() is explicit and unambiguous.
-    """
+    """Nearest SENSEX monthly futures expiry on or after trade_date.
+    Honours the BSE 2026-05 rule change (last-Thu → last-Wed)."""
     y, m = trade_date.year, trade_date.month
     for _ in range(3):
-        exp = _last_thursday(y, m)
+        exp = _sensex_monthly_expiry(y, m)
         if exp >= trade_date:
             return exp
         if m == 12:
@@ -96,9 +104,16 @@ def _fetch_day_1m(g, trade_date: date) -> pd.DataFrame:
         candles = r.get('candles', [])
         if not candles:
             return pd.DataFrame()
-        df = pd.DataFrame(
-            candles, columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'oi']
-        )
+        # Groww returns 7 cols (with OI) for NSE-FNO but 6 cols (no OI) for
+        # BSE-SENSEX-FUT. Build columns dynamically off the actual row width.
+        ncols = len(candles[0])
+        base = ['ts', 'open', 'high', 'low', 'close', 'volume']
+        cols = base + (['oi'] if ncols >= 7 else [])
+        # Drop any extra trailing columns beyond what we name
+        cols += [f'_x{i}' for i in range(ncols - len(cols))]
+        df = pd.DataFrame(candles, columns=cols)
+        if 'oi' not in df.columns:
+            df['oi'] = pd.NA          # keep schema stable downstream
         df['ts'] = pd.to_datetime(df['ts'])
         df['date'] = df['ts'].dt.date
         df['time'] = df['ts'].dt.time
@@ -107,7 +122,7 @@ def _fetch_day_1m(g, trade_date: date) -> pd.DataFrame:
             df[['open', 'high', 'low', 'close', 'volume', 'oi']].apply(
                 pd.to_numeric, errors='coerce'
             )
-        return df
+        return df[['ts','open','high','low','close','volume','oi','date','time']]
     except Exception as e:
         log.error(
             "fetch_day_1m trade_date=%s symbol=%s error=%s", trade_date, symbol, e
@@ -140,6 +155,9 @@ def fetch_and_cache(lookback_days: int = 35, force_full: bool = False):
     new_frames = []
     fetched = 0
 
+    from datetime import datetime as _dt, time as _tm
+    market_done = _dt.now().time() >= _tm(15, 30)
+
     for i in range(lookback_days, -1, -1):
         d = today - timedelta(days=i)
         if d.weekday() >= 5:
@@ -147,6 +165,9 @@ def fetch_and_cache(lookback_days: int = 35, force_full: bool = False):
         if d in cached_dates:
             continue
         if d > today:
+            continue
+        # Skip today if market hasn't closed yet (Groww rejects future timestamps)
+        if d == today and not market_done:
             continue
 
         log.info("Fetching %s ...", d)

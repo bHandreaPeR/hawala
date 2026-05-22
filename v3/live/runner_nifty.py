@@ -65,6 +65,7 @@ from v3.signals.fii_dii_classifier import (
     THRESHOLDS_FILE,
 )
 from alerts.telegram import send as _tg_send
+from v3.live.flow_conflict import FlowConflictTracker, evaluate as _fc_evaluate
 
 # ── Constants ────────────────────────────────────────────────────────────────
 NIFTY_LOT    = 65
@@ -86,8 +87,44 @@ MIN_REVERSAL_HOLD = 20
 MIN_SIGNAL_COUNT = 5   # minimum signals (of 6) that must agree before entry
 MOMENTUM_BARS    = 30  # price must trend in signal direction for last 30 bars
 
+# Option-flow confluence filter (opt-in, env-gated)
+# Reads v3/cache/option_flow_NIFTY.json — produced by alerts/option_flow_daemon.
+# When V3_REQUIRE_OPTION_FLOW_CONFIRM=1 in env, suppresses entries whose
+# direction disagrees with the 5-sec OI flow daemon's session direction.
+# Default OFF — measure correlation for 2-3 weeks before flipping on.
+import os as _os
+REQUIRE_OPTION_FLOW_CONFIRM = _os.environ.get("V3_REQUIRE_OPTION_FLOW_CONFIRM",
+                                               "0").lower() in ("1", "true", "yes")
+OPTION_FLOW_MAX_AGE_SEC = 60   # ignore the file if stale beyond this
+
 # OI velocity rolling window
 OI_HISTORY_MAXLEN = 60    # keep 60 bars of OI history per strike (matches backtest VELOCITY_WINDOW)
+
+
+# ── Option-flow confluence reader ───────────────────────────────────────────
+def _read_option_flow_direction(inst: str) -> int:
+    """Read the option-flow daemon's latest direction for an instrument.
+
+    Returns +1 / -1 / 0. Returns 0 if file is missing, malformed, or stale
+    beyond OPTION_FLOW_MAX_AGE_SEC. Safe to call always (caller decides
+    whether to act on it).
+    """
+    import json as _json
+    from datetime import datetime as _dt
+    try:
+        p = ROOT / 'v3' / 'cache' / f'option_flow_{inst}.json'
+        if not p.exists():
+            return 0
+        d = _json.loads(p.read_text())
+        ts = _dt.fromisoformat(d.get('ts', ''))
+        age = (_dt.now(ts.tzinfo) - ts).total_seconds() if ts.tzinfo else 9999
+        if age > OPTION_FLOW_MAX_AGE_SEC:
+            return 0
+        # Use session CVD direction (more stable than single-snapshot net)
+        cvd = float(d.get('cvd', 0.0))
+        return +1 if cvd > 0 else (-1 if cvd < 0 else 0)
+    except Exception:
+        return 0
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def _get_groww():
@@ -98,10 +135,24 @@ def _get_groww():
             if '=' in line:
                 k, _, v = line.strip().partition('=')
                 env[k] = v
-    totp  = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
-    token = GrowwAPI.get_access_token(api_key=env['GROWW_API_KEY'], totp=totp)
-    log.info("Groww auth OK")
-    return GrowwAPI(token=token)
+    totp = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
+    # 3-try retry with 5s backoff — single transient Groww error at boot
+    # used to kill the entire session (May 11 + May 15 crashes).
+    last_err = None
+    for attempt in range(3):
+        try:
+            token = GrowwAPI.get_access_token(api_key=env['GROWW_API_KEY'], totp=totp)
+            log.info("Groww auth OK (attempt %d)", attempt + 1)
+            return GrowwAPI(token=token)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                log.warning("Groww auth attempt %d failed, retry 5s: %s", attempt + 1, e)
+                import time as _t; _t.sleep(5)
+                # Refresh TOTP — 30s window may have passed
+                totp = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
+    log.error("Groww auth failed after 3 attempts: %s", last_err)
+    raise last_err
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────────────
@@ -267,6 +318,7 @@ def _fmt_exit_alert(
         'TP':       '🎯 Take Profit hit (+100%)',
         'EOD':      '🕥 EOD exit (15:20)',
         'REVERSAL': '🔄 Signal reversal',
+        'FLOW_SL':  '🔴 Flow-conflict premature stop (L3)',
     }
     reason_str = reason_map.get(exit_reason, exit_reason)
 
@@ -811,6 +863,15 @@ def _refresh_morning_bhavcopy(today: date) -> tuple[float, float]:
                 "Morning bhavcopy: %s already cached — skipping fetch",
                 yesterday_str,
             )
+            # The network fetch is skipped — but pcr_daily.csv must still be
+            # refreshed, else it silently goes stale (ops/autoheal.py at 06:55
+            # pre-fetches the bhavcopy .pkl, which is what lands us here).
+            try:
+                from v3.data.build_pcr_daily import build_pcr_daily
+                log.info("pcr_daily.csv refresh (cached path): %s",
+                         build_pcr_daily())
+            except Exception as e:
+                log.warning("pcr_daily.csv refresh from cache failed: %s", e)
             # Still recompute pcr_val / pcr_ma from the cache
             return _pcr_from_bhav_cache(bhav_cache, today)
     else:
@@ -1288,6 +1349,7 @@ def run(paper: bool = True):
 
     position: Optional[dict] = None   # {side, strike, entry_price, entry_time, qty}
     bars_in_position: int = 0         # bars elapsed since entry (reversal check)
+    flow_tracker: Optional[FlowConflictTracker] = None   # flow-conflict exit assist
     morning_alert_sent: bool = False  # send once per session
     df_fut: pd.DataFrame = pd.DataFrame()  # last fetched futures bars — used by EOD persist
 
@@ -1515,6 +1577,18 @@ def run(paper: bool = True):
                 state.signal_count, MIN_SIGNAL_COUNT,
             )
 
+        # F6: option-flow confluence (env-gated, default off)
+        # Suppress entry when the 5-sec strike-level OI flow daemon's session
+        # direction disagrees with this runner's signal.
+        if REQUIRE_OPTION_FLOW_CONFIRM and effective_dir != 0:
+            _flow_dir = _read_option_flow_direction('NIFTY')
+            if _flow_dir != 0 and _flow_dir != effective_dir:
+                log.info(
+                    "F6 veto: option_flow_dir=%+d disagrees with effective_dir=%+d",
+                    _flow_dir, effective_dir,
+                )
+                effective_dir = 0
+
         # No-intraday suppression: mirrors backtest logic.
         # If OI velocity is empty (no near-money strikes with data) AND the
         # FII/DII classifier has no result, the two most informative real-time
@@ -1593,6 +1667,7 @@ def run(paper: bool = True):
             _tg_broadcast(tg_token, tg_chats, entry_msg)
 
             bars_in_position = 0
+            flow_tracker     = FlowConflictTracker()
 
             if not paper:
                 raise NotImplementedError(
@@ -1635,6 +1710,37 @@ def run(paper: bool = True):
                 pnl_pts, pnl_pct * 100, pnl_inr,
             )
 
+            # ── Flow-Conflict Exit Assist (L1/L2/L3) ──────────────────────────
+            fc = _fc_evaluate('NIFTY', position['direction'], pnl_pct,
+                              flow_tracker)
+            if fc is not None:
+                log.info(
+                    "[FLOW-CONFLICT L%d] %s conviction=%+.2f band=%+d "
+                    "consec=%d pnl=%.1f%% force_exit=%s",
+                    fc['level'], fc['action'], fc['conviction'], fc['band'],
+                    fc['consec'], pnl_pct * 100, fc['force_exit'],
+                )
+                _tg_broadcast(tg_token, tg_chats, fc['message'])
+                if fc['force_exit']:
+                    exit_reason = 'FLOW_SL'
+                    result_str  = 'WIN' if pnl_pts > 0 else 'LOSS'
+                    log.info(
+                        "[EXIT FLOW_SL] %s %s strike=%d  entry=%.2f  "
+                        "exit=%.2f  pnl=%.2f pts (%.1f%%)  ₹%.0f",
+                        'PAPER' if paper else 'LIVE', side, strike, entry_px,
+                        current_ltp, pnl_pts, pnl_pct * 100, pnl_inr,
+                    )
+                    exit_msg = _fmt_exit_alert(
+                        position, float(current_ltp), exit_reason,
+                        pnl_pts, pnl_inr, paper,
+                    )
+                    _tg_broadcast(tg_token, tg_chats, exit_msg)
+                    position = None
+                    bars_in_position = 0
+                    flow_tracker = None
+                    time.sleep(60)
+                    continue
+
             # ── SL / TP check ─────────────────────────────────────────────────
             sl_hit = pnl_pct <= SL_PCT
             tp_hit = pnl_pct >= TP_PCT
@@ -1657,6 +1763,7 @@ def run(paper: bool = True):
                 _tg_broadcast(tg_token, tg_chats, exit_msg)
                 position = None
                 bars_in_position = 0
+                flow_tracker = None
                 time.sleep(60)
                 continue
 
@@ -1681,6 +1788,7 @@ def run(paper: bool = True):
                     _tg_broadcast(tg_token, tg_chats, exit_msg)
                     position = None
                     bars_in_position = 0
+                    flow_tracker = None
                     time.sleep(60)
                     continue
 
@@ -1702,6 +1810,7 @@ def run(paper: bool = True):
                 _tg_broadcast(tg_token, tg_chats, exit_msg)
                 position = None
                 bars_in_position = 0
+                flow_tracker = None
                 break
 
         # ── Idle ──────────────────────────────────────────────────────────────

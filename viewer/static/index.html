@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Hawala Live Footprint</title>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Hawala · Live Footprint</div>
+    <div class="controls">
+      <label>Symbol
+        <select id="inst"></select>
+      </label>
+      <label>Timeframe
+        <select id="tf">
+          <option value="1min">1m</option>
+          <option value="3min">3m</option>
+          <option value="5min" selected>5m</option>
+          <option value="15min">15m</option>
+        </select>
+      </label>
+      <label>Cell
+        <select id="cell"></select>
+      </label>
+      <label>Date
+        <input id="date" type="date" />
+      </label>
+      <button id="pause" class="btn">⏸ Pause</button>
+      <button id="autoscroll" class="btn btn-active">↦ Auto-scroll</button>
+      <button id="reload"  class="btn">⟳ Reload</button>
+      <span id="status" class="status">connecting…</span>
+    </div>
+  </header>
+  <main>
+    <div id="chart"></div>
+  </main>
+  <footer class="bottombar">
+    <span id="tick_counter">ticks: 0</span>
+    <span id="last_update">last: —</span>
+    <span id="ws_state">ws: —</span>
+    <span id="meta"></span>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
