@@ -20,8 +20,8 @@ cd D:\Hawala
 git clone https://github.com/bHandreaPeR/hawala.git "Hawala v2"
 cd "Hawala v2"
 
-# 2. Install Python deps
-D:\anaconda3\python.exe -m pip install -r requirements.txt
+# 2. Install Python deps (uses --no-deps trick for growwapi vs numpy<2.0)
+.\windows\install_deps.ps1
 
 # 3. Restore secrets + caches (point to your tarball path)
 tar -xzvf "C:\path\to\hawala_secrets_and_caches.tar.gz"
