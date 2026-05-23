@@ -266,6 +266,7 @@ def check_cron(checks: list) -> None:
         ('viewer.live_server',           'live footprint viewer'),
         ('alerts.vp_paper_journal',      'VP paper journal'),
         ('alerts.vp_paper_executor',     'VP paper executor (intraday)'),
+        ('git_sync.ps1',                 'git auto-sync'),
         ('alerts.index_1m_intraday',     'index 1m intraday fetcher'),
         ('daily_fetch.sh',               'daily candle fetch'),
     ]

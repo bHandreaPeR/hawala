@@ -19,6 +19,8 @@ BASE_DIR = r"D:\Hawala\Hawala v2"
 # args is the python -m / script + args
 TASKS = [
     # (name,                    time,   kind,        program, args, comment)
+    ('Hawala-GitSync',          '06:50','daily-mtf', 'powershell.exe', r'-ExecutionPolicy Bypass -File ops\git_sync.ps1',
+        'Pull latest code from main (safe --ff-only) before autoheal'),
     ('Hawala-Autoheal',         '06:55','daily-mtf', PYTHON,  r'ops\autoheal.py',
         'Self-heal stale caches before market open'),
     ('Hawala-Healthcheck',      '07:25','daily-mtf', PYTHON,  r'ops\healthcheck.py',

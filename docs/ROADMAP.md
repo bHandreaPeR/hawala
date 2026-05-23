@@ -17,6 +17,7 @@ This is the working punch-list. Items roll off as they ship.
 7. **News pipeline tightening** — anchor-word gate, hour/day/theme caps, EOD digest
 8. **Mac → Windows migration** — Task Scheduler XMLs, PowerShell ports, full system handover
 9. **Mac → Windows SSH heartbeat** — every 10 min via launchd, MACRO bot alerts on outage
+10. **Windows auto git-pull** (`ops/git_sync.ps1`) — daily 06:50 task, --ff-only, safe abort on dirty tree
 
 ---
 
@@ -33,12 +34,6 @@ This is the working punch-list. Items roll off as they ship.
   - ~40 LOC bot handler + integrate into news.runner or a new tiny daemon.
 
 - **`/status` command** — show all daemons alive + last activity per Telegram.
-
-### Auto git-pull on Windows
-- **Daily 06:50 task** that runs `git pull --ff-only` before autoheal/healthcheck/runners. So you push from Mac → next morning Windows runs it.
-  - File: `ops/git_sync.ps1`
-  - XML: `windows/scheduled_tasks/Hawala-GitSync.xml`
-  - ~30 LOC. Idempotent. Safe (--ff-only never rewrites).
 
 ---
 
