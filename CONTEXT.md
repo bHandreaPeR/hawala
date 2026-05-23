@@ -4,7 +4,28 @@
 > investigation. It tells you what was built, what is in production, what was
 > rejected and why, and where everything lives. Keep it in sync as you go.
 >
-> Last updated: 2026-05-10 after the May-2026 directory consolidation.
+> Last updated: 2026-05-23 — Mac→Windows migration complete + footprint pipeline +
+> re-entry cooldown + VP intraday executor + Mac→Windows SSH heartbeat.
+
+---
+
+## 0. Where production runs (post 2026-05-23 migration)
+
+**Production runs on Windows.** Mac is dev-only now.
+
+| Machine | Role |
+|---|---|
+| **Windows (LAPTOP-JJOUAFCP, 192.168.0.6)** | All 17 scheduled tasks fire here. The "production box". Anaconda at `D:\anaconda3\`, repo at `D:\Hawala\Hawala v2`. |
+| **Mac** | Dev only. Project Iris crons still run. Hawala SSH heartbeat (launchd `com.hawala.winheartbeat`) checks Windows every 10 min → MACRO bot alert if DOWN ≥20 min. |
+
+Mac→Windows over SSH (`hawala-win` alias, ed25519 key, LocalForward 8765 for the
+live viewer). Single `main` branch on `bHandreaPeR/hawala` on GitHub.
+
+17 scheduled tasks live in `windows/scheduled_tasks/*.xml`. Regenerate via
+`python windows/generate_tasks.py`. Re-import via `windows/IMPORT_TASKS.ps1`
+(Administrator PowerShell).
+
+See: `docs/WINDOWS_MIGRATION.md` for full migration plan + rollback.
 
 ---
 
