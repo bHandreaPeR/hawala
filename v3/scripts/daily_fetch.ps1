@@ -5,7 +5,7 @@
 # Triggered by Task Scheduler `Hawala-DailyFetch` at 16:30 IST weekdays.
 #
 # To run manually:
-#   cd "C:\Hawala\Hawala v2"
+#   cd "D:\Hawala\Hawala v2"
 #   powershell -ExecutionPolicy Bypass -File v3\scripts\daily_fetch.ps1
 # =============================================================================
 
@@ -16,7 +16,7 @@ $SCRIPT_DIR   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PROJECT_ROOT = Split-Path -Parent (Split-Path -Parent $SCRIPT_DIR)
 $LOG_DIR      = Join-Path $PROJECT_ROOT "v3\logs"
 $TIMESTAMP    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-$PYTHON       = "C:\anaconda3\python.exe"
+$PYTHON       = "D:\anaconda3\python.exe"
 
 New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
 Set-Location $PROJECT_ROOT

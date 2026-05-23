@@ -13,7 +13,7 @@ $SCRIPT_DIR   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PROJECT_ROOT = Split-Path -Parent (Split-Path -Parent $SCRIPT_DIR)
 $LOG_DIR      = Join-Path $PROJECT_ROOT "v3\logs"
 $TIMESTAMP    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-$PYTHON       = "C:\anaconda3\python.exe"
+$PYTHON       = "D:\anaconda3\python.exe"
 $DRY_RUN      = if ($args -contains "--dry-run") { "--dry-run" } else { "" }
 
 New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null

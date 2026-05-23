@@ -1,7 +1,7 @@
 # windows/IMPORT_TASKS.ps1 — One-shot import of all 16 Hawala scheduled tasks.
 #
 # Run from PowerShell ADMIN:
-#   cd "C:\Hawala\Hawala v2"
+#   cd "D:\Hawala\Hawala v2"
 #   .\windows\IMPORT_TASKS.ps1
 #
 # Idempotent — re-running deletes + re-imports each task. Safe to run after

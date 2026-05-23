@@ -4,7 +4,7 @@ Full plan is in `docs/WINDOWS_MIGRATION.md`. This is the **happy path**.
 
 ## Pre-reqs (install once)
 
-1. **Anaconda Python 3.13** → install to `C:\anaconda3\` (avoid spaces, avoid Program Files)
+1. **Anaconda Python 3.13** → install to `D:\anaconda3\` (avoid spaces, avoid Program Files)
 2. **Git for Windows** → default options
 3. **Google Chrome**
 4. Set TZ to **India Standard Time** if not already: `Set-TimeZone -Id "India Standard Time"`
@@ -15,13 +15,13 @@ Open **PowerShell as Administrator**:
 
 ```powershell
 # 1. Clone
-mkdir C:\Hawala
-cd C:\Hawala
+mkdir D:\Hawala
+cd D:\Hawala
 git clone https://github.com/bHandreaPeR/hawala.git "Hawala v2"
 cd "Hawala v2"
 
 # 2. Install Python deps
-C:\anaconda3\python.exe -m pip install -r requirements.txt
+D:\anaconda3\python.exe -m pip install -r requirements.txt
 
 # 3. Restore secrets + caches (point to your tarball path)
 tar -xzvf "C:\path\to\hawala_secrets_and_caches.tar.gz"
@@ -36,10 +36,10 @@ That's it. The 16 tasks are now in Task Scheduler under `\Hawala\`.
 
 ```powershell
 # Should print "Auth validated OK"
-C:\anaconda3\python.exe -c "from v3.data.fetch_1m_NIFTY import _get_groww, _validate_auth; _validate_auth(_get_groww())"
+D:\anaconda3\python.exe -c "from v3.data.fetch_1m_NIFTY import _get_groww, _validate_auth; _validate_auth(_get_groww())"
 
 # Should pass except for "today's log" entries that need crons to have fired
-C:\anaconda3\python.exe ops\healthcheck.py --dry
+D:\anaconda3\python.exe ops\healthcheck.py --dry
 
 # Manually trigger one task from PowerShell to test
 schtasks /Run /TN "\Hawala\Hawala-Healthcheck"
@@ -96,8 +96,8 @@ ops/
 
 Edit `windows/generate_tasks.py`:
 ```python
-PYTHON   = r"C:\anaconda3\python.exe"
-BASE_DIR = r"C:\Hawala\Hawala v2"
+PYTHON   = r"D:\anaconda3\python.exe"
+BASE_DIR = r"D:\Hawala\Hawala v2"
 ```
 Then re-run `python windows/generate_tasks.py && powershell .\windows\IMPORT_TASKS.ps1`.
 

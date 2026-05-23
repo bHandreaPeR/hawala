@@ -13,8 +13,8 @@
 | Sleep prevention per-process | `caffeinate -i …` | Drop entirely — TS wake handles it |
 | Process kill | `pkill -f …` | `taskkill /F /IM …` or `Get-Process … | Stop-Process` |
 | Shell scripts | bash (`*.sh`) | PowerShell (`*.ps1`) |
-| Python | `/opt/anaconda3/bin/python3` | `C:\anaconda3\python.exe` (or wherever) |
-| Path style | `/Users/…/Hawala v2` | `C:\Hawala\Hawala v2` (no spaces preferred) |
+| Python | `/opt/anaconda3/bin/python3` | `D:\anaconda3\python.exe` (or wherever) |
+| Path style | `/Users/…/Hawala v2` | `D:\Hawala\Hawala v2` (no spaces preferred) |
 
 **Total work**: ~4 hours focused.
 
@@ -49,7 +49,7 @@
 ## Phase 1 — Windows machine prep (~45 min)
 
 ### 1.1 Install fundamentals
-- **Anaconda Python 3.13** — installer from anaconda.com. Install path `C:\anaconda3\` (avoid spaces, avoid Program Files). Check "Add to PATH".
+- **Anaconda Python 3.13** — installer from anaconda.com. Install path `D:\anaconda3\` (avoid spaces, avoid Program Files). Check "Add to PATH".
 - **Git for Windows** — gitforwindows.org. Gives you `git`, `bash`, `ssh`. Default options are fine.
 - **Google Chrome** — for the viewer + headless PDF generation.
 - **Notepad++** or **VS Code** — for editing `.ps1` and config files.
@@ -59,27 +59,27 @@ Open **PowerShell as Administrator** and run:
 ```powershell
 python --version          # should show 3.13.x
 git --version             # should show 2.x
-"C:\anaconda3\python.exe" --version
+"D:\anaconda3\python.exe" --version
 ```
 
 ### 1.3 Clone the repo
 ```powershell
-mkdir C:\Hawala
-cd C:\Hawala
+mkdir D:\Hawala
+cd D:\Hawala
 git clone https://github.com/bHandreaPeR/hawala-v2 "Hawala v2"
 cd "Hawala v2"
 ```
 
 ### 1.4 Install Python packages
 ```powershell
-C:\anaconda3\python.exe -m pip install -r requirements.txt
+D:\anaconda3\python.exe -m pip install -r requirements.txt
 ```
 Take coffee. ~5 minutes.
 
 ### 1.5 Restore secrets + caches
 - Extract the tarball into the repo root:
   ```powershell
-  cd "C:\Hawala\Hawala v2"
+  cd "D:\Hawala\Hawala v2"
   tar -xzvf C:\path\to\hawala_secrets_and_caches.tar.gz
   ```
 - Verify: `Get-ChildItem token.env, v3\cache\candles_1m_NIFTY.pkl` — both must exist.
@@ -87,13 +87,13 @@ Take coffee. ~5 minutes.
 ### 1.6 Sanity-test before touching scheduler
 ```powershell
 # Auth test — should print "Auth validated OK"
-C:\anaconda3\python.exe -c "from v3.data.fetch_1m_NIFTY import _get_groww, _validate_auth; _validate_auth(_get_groww())"
+D:\anaconda3\python.exe -c "from v3.data.fetch_1m_NIFTY import _get_groww, _validate_auth; _validate_auth(_get_groww())"
 
 # Strategy import test
-C:\anaconda3\python.exe -c "from strategies.vp_trailing_swing import run_vp_trailing_swing; print('OK')"
+D:\anaconda3\python.exe -c "from strategies.vp_trailing_swing import run_vp_trailing_swing; print('OK')"
 
 # Viewer port test (background, then kill)
-Start-Process -NoNewWindow C:\anaconda3\python.exe -ArgumentList "-m viewer.live_server"
+Start-Process -NoNewWindow D:\anaconda3\python.exe -ArgumentList "-m viewer.live_server"
 Start-Sleep 4
 curl http://127.0.0.1:8765/config
 Stop-Process -Name python -Force
@@ -127,22 +127,22 @@ For each, **Action → Start a program**:
 
 | # | Name | Time IST | Program | Arguments | Start in |
 |---|---|---|---|---|---|
-| 1 | Hawala-DailyReport | 07:32 | `C:\anaconda3\python.exe` | `run_daily_report.py` | `C:\Hawala\Hawala v2` |
-| 2 | Hawala-Autoheal | 06:55 | `C:\anaconda3\python.exe` | `ops\autoheal.py` | `C:\Hawala\Hawala v2` |
-| 3 | Hawala-Healthcheck | 07:25 | `C:\anaconda3\python.exe` | `ops\healthcheck.py` | `C:\Hawala\Hawala v2` |
-| 4 | Hawala-NewsRunner | 09:00 | `C:\anaconda3\python.exe` | `-m news.runner` | `C:\Hawala\Hawala v2` |
-| 5 | Hawala-Index1mIntraday | 09:11 | `C:\anaconda3\python.exe` | `-m alerts.index_1m_intraday` | `C:\Hawala\Hawala v2` |
-| 6 | Hawala-V3-NIFTY | 09:12 | `C:\anaconda3\python.exe` | `v3\live\runner_nifty.py` | `C:\Hawala\Hawala v2` |
-| 7 | Hawala-V3-BANKNIFTY | 09:12 | `C:\anaconda3\python.exe` | `v3\live\runner_banknifty.py` | `C:\Hawala\Hawala v2` |
-| 8 | Hawala-VPTrail | 09:12 | `C:\anaconda3\python.exe` | `-m alerts.vp_live_daemon --mode daemon` | `C:\Hawala\Hawala v2` |
-| 9 | Hawala-OptionFlow | 09:12 | `C:\anaconda3\python.exe` | `-m alerts.option_flow_daemon --mode daemon` | `C:\Hawala\Hawala v2` |
-| 10 | Hawala-TickRecorder | 09:12 | `C:\anaconda3\python.exe` | `-m alerts.tick_recorder` | `C:\Hawala\Hawala v2` |
-| 11 | Hawala-Viewer | 09:13 | `C:\anaconda3\python.exe` | `-m viewer.live_server --host 127.0.0.1 --port 8765` | `C:\Hawala\Hawala v2` |
-| 12 | Hawala-DailyFetch | 16:30 | `C:\anaconda3\python.exe` | `v3\scripts\daily_fetch.py` *(needs porting from .sh — see Phase 3)* | `C:\Hawala\Hawala v2` |
-| 13 | Hawala-VPPaperJournal | 16:35 | `C:\anaconda3\python.exe` | `-m alerts.vp_paper_journal` | `C:\Hawala\Hawala v2` |
-| 14 | Hawala-PkillAll | 03:30 | `powershell.exe` | `-File ops\windows_pkill.ps1` *(see Phase 3)* | `C:\Hawala\Hawala v2` |
-| 15 | Hawala-WeeklyReport | Fri 18:00 | `C:\anaconda3\python.exe` | `run_weekly_report.py` | `C:\Hawala\Hawala v2` |
-| 16 | Hawala-WeeklyBackfill | Sun 02:30 | `C:\anaconda3\python.exe` | `v3\scripts\weekly_backfill.py` *(needs porting)* | `C:\Hawala\Hawala v2` |
+| 1 | Hawala-DailyReport | 07:32 | `D:\anaconda3\python.exe` | `run_daily_report.py` | `D:\Hawala\Hawala v2` |
+| 2 | Hawala-Autoheal | 06:55 | `D:\anaconda3\python.exe` | `ops\autoheal.py` | `D:\Hawala\Hawala v2` |
+| 3 | Hawala-Healthcheck | 07:25 | `D:\anaconda3\python.exe` | `ops\healthcheck.py` | `D:\Hawala\Hawala v2` |
+| 4 | Hawala-NewsRunner | 09:00 | `D:\anaconda3\python.exe` | `-m news.runner` | `D:\Hawala\Hawala v2` |
+| 5 | Hawala-Index1mIntraday | 09:11 | `D:\anaconda3\python.exe` | `-m alerts.index_1m_intraday` | `D:\Hawala\Hawala v2` |
+| 6 | Hawala-V3-NIFTY | 09:12 | `D:\anaconda3\python.exe` | `v3\live\runner_nifty.py` | `D:\Hawala\Hawala v2` |
+| 7 | Hawala-V3-BANKNIFTY | 09:12 | `D:\anaconda3\python.exe` | `v3\live\runner_banknifty.py` | `D:\Hawala\Hawala v2` |
+| 8 | Hawala-VPTrail | 09:12 | `D:\anaconda3\python.exe` | `-m alerts.vp_live_daemon --mode daemon` | `D:\Hawala\Hawala v2` |
+| 9 | Hawala-OptionFlow | 09:12 | `D:\anaconda3\python.exe` | `-m alerts.option_flow_daemon --mode daemon` | `D:\Hawala\Hawala v2` |
+| 10 | Hawala-TickRecorder | 09:12 | `D:\anaconda3\python.exe` | `-m alerts.tick_recorder` | `D:\Hawala\Hawala v2` |
+| 11 | Hawala-Viewer | 09:13 | `D:\anaconda3\python.exe` | `-m viewer.live_server --host 127.0.0.1 --port 8765` | `D:\Hawala\Hawala v2` |
+| 12 | Hawala-DailyFetch | 16:30 | `D:\anaconda3\python.exe` | `v3\scripts\daily_fetch.py` *(needs porting from .sh — see Phase 3)* | `D:\Hawala\Hawala v2` |
+| 13 | Hawala-VPPaperJournal | 16:35 | `D:\anaconda3\python.exe` | `-m alerts.vp_paper_journal` | `D:\Hawala\Hawala v2` |
+| 14 | Hawala-PkillAll | 03:30 | `powershell.exe` | `-File ops\windows_pkill.ps1` *(see Phase 3)* | `D:\Hawala\Hawala v2` |
+| 15 | Hawala-WeeklyReport | Fri 18:00 | `D:\anaconda3\python.exe` | `run_weekly_report.py` | `D:\Hawala\Hawala v2` |
+| 16 | Hawala-WeeklyBackfill | Sun 02:30 | `D:\anaconda3\python.exe` | `v3\scripts\weekly_backfill.py` *(needs porting)* | `D:\Hawala\Hawala v2` |
 
 **Tip**: use `schtasks /create /XML <file>.xml /TN <name>` to import all 16 at once instead of clicking through the GUI. I'll generate the 16 XML files as a follow-up if you want.
 
@@ -170,8 +170,8 @@ Calls the 4 fetchers in sequence. Pattern:
 ```powershell
 # v3/scripts/daily_fetch.ps1
 $ErrorActionPreference = "Continue"
-Set-Location "C:\Hawala\Hawala v2"
-$py = "C:\anaconda3\python.exe"
+Set-Location "D:\Hawala\Hawala v2"
+$py = "D:\anaconda3\python.exe"
 & $py v3\data\fetch_1m_NIFTY.py
 & $py v3\data\fetch_1m_BANKNIFTY.py
 & $py v3\data\fetch_1m_SENSEX.py
@@ -220,16 +220,16 @@ I'll create these three files in a follow-up commit.
 After all tasks are imported:
 
 ### 4.1 Manual smoke test (don't wait for cron)
-Open PowerShell at `C:\Hawala\Hawala v2`:
+Open PowerShell at `D:\Hawala\Hawala v2`:
 ```powershell
 # 1. Healthcheck — should show all PASS except today's logs (those need crons to have fired)
-C:\anaconda3\python.exe ops\healthcheck.py --dry
+D:\anaconda3\python.exe ops\healthcheck.py --dry
 
 # 2. VP paper journal — should add zero new trades but build a summary
-C:\anaconda3\python.exe -m alerts.vp_paper_journal
+D:\anaconda3\python.exe -m alerts.vp_paper_journal
 
 # 3. Viewer — should start and respond
-Start-Process C:\anaconda3\python.exe -ArgumentList "-m viewer.live_server"
+Start-Process D:\anaconda3\python.exe -ArgumentList "-m viewer.live_server"
 Start-Sleep 5
 curl http://127.0.0.1:8765/config
 ```
@@ -238,7 +238,7 @@ curl http://127.0.0.1:8765/config
 Right-click any task → **Run** — verify it executes successfully. Check its history tab.
 
 ### 4.3 Verify wake-on-schedule
-1. Set a temporary task: 5 minutes from now, "Wake the computer", action = nothing useful (e.g. `C:\Windows\System32\cmd.exe /c echo ok > C:\Hawala\wake_test.txt`).
+1. Set a temporary task: 5 minutes from now, "Wake the computer", action = nothing useful (e.g. `C:\Windows\System32\cmd.exe /c echo ok > D:\Hawala\wake_test.txt`).
 2. Lock the screen, close the lid (laptop) or let it idle to sleep.
 3. Come back after the trigger time. The file should exist + Task Scheduler history should show success.
 
@@ -301,7 +301,7 @@ Mac → Windows is a one-way arrow only if you delete the Mac caches. Keep them 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | `token.env` missing on Windows | High if forgotten | Tarball Phase 0 covers it; smoke test in Phase 1.6 catches it |
-| Path with spaces breaks something | Medium | Quote every path in PowerShell + use `C:\Hawala\Hawala v2` not Program Files |
+| Path with spaces breaks something | Medium | Quote every path in PowerShell + use `D:\Hawala\Hawala v2` not Program Files |
 | Wake-on-schedule disabled in BIOS | Low | Phase 4.3 verification |
 | Groww auth fails first run | Low | The retry logic handles it; check token.env on disk |
 | Task Scheduler runs program as wrong user | Medium | Use "Run whether user is logged on or not" + tick "Run with highest privileges" |

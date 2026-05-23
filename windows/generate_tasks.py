@@ -10,8 +10,8 @@ import pathlib
 import datetime as dt
 
 # ── EDIT THESE if your install paths differ on Windows ──────────────────
-PYTHON   = r"C:\anaconda3\python.exe"
-BASE_DIR = r"C:\Hawala\Hawala v2"
+PYTHON   = r"D:\anaconda3\python.exe"
+BASE_DIR = r"D:\Hawala\Hawala v2"
 
 # ── Task table ──────────────────────────────────────────────────────────
 # (name, time_HH:MM, daysofweek, kind, args, comment)
