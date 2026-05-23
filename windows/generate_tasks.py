@@ -41,6 +41,8 @@ TASKS = [
         'Lee-Ready tick recorder for footprint'),
     ('Hawala-Viewer',           '09:13','daily-mtf', PYTHON,  '-m viewer.live_server --host 127.0.0.1 --port 8765',
         'Live footprint viewer backend'),
+    ('Hawala-VPPaperExecutor',  '09:12','daily-mtf', PYTHON,  '-m alerts.vp_paper_executor',
+        'VP-Trail intraday exit watcher (Telegram on each close)'),
     ('Hawala-DailyFetch',       '16:30','daily-mtf', 'powershell.exe', r'-ExecutionPolicy Bypass -File v3\scripts\daily_fetch.ps1',
         'EOD: fetch 1m + OI + FII + bhavcopy'),
     ('Hawala-VPPaperJournal',   '16:35','daily-mtf', PYTHON,  '-m alerts.vp_paper_journal',

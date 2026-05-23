@@ -265,6 +265,7 @@ def check_cron(checks: list) -> None:
         ('alerts.tick_recorder',         'tick recorder'),
         ('viewer.live_server',           'live footprint viewer'),
         ('alerts.vp_paper_journal',      'VP paper journal'),
+        ('alerts.vp_paper_executor',     'VP paper executor (intraday)'),
         ('alerts.index_1m_intraday',     'index 1m intraday fetcher'),
         ('daily_fetch.sh',               'daily candle fetch'),
     ]
@@ -419,6 +420,10 @@ def check_code(checks: list) -> None:
         'alerts/tick_recorder.py',
         'alerts/index_1m_intraday.py',
         'alerts/vp_paper_journal.py',
+        'alerts/vp_paper_executor.py',
+        'v3/live/reentry_cooldown.py',
+        'research/footprint_features.py',
+        'research/footprint_correlation.py',
         'viewer/live_server.py',
     ]
     parse_fail = []

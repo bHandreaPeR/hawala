@@ -87,6 +87,10 @@ from v3.signals.fii_dii_classifier_COMBINED import (
 )
 from alerts.telegram import send as _tg_send
 from v3.live.flow_conflict import FlowConflictTracker, evaluate as _fc_evaluate
+from v3.live.reentry_cooldown import (
+    is_in_cooldown as _re_is_in_cooldown,
+    record_force_exit as _re_record_force_exit,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BN_LOT         = 30
@@ -1635,6 +1639,13 @@ def run(paper: bool = True):
             side   = 'CE' if effective_dir == 1 else 'PE'
             strike = atm
 
+            # ── Re-entry cooldown — see v3/live/reentry_cooldown.py ──────────
+            blocked, why = _re_is_in_cooldown('BANKNIFTY', effective_dir, strike, now)
+            if blocked:
+                log.info("[ENTRY BLOCKED] %s", why)
+                time.sleep(60)
+                continue
+
             # Get entry LTP from option chain snapshot (no extra API call)
             if side == 'CE':
                 opt_ltp = chain['ce_ltp'].get(strike)
@@ -1767,6 +1778,10 @@ def run(paper: bool = True):
                         pnl_pts, pnl_inr, paper,
                     )
                     _tg_broadcast(tg_token, tg_chats, exit_msg)
+                    # Arm re-entry cooldown so we don't re-buy same direction
+                    # near this strike for COOLDOWN_MIN minutes.
+                    _re_record_force_exit('BANKNIFTY', position['direction'],
+                                          strike, 'FLOW_SL', now)
                     position         = None
                     bars_in_position = 0
                     max_pnl_pct      = 0.0

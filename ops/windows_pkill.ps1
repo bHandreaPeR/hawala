@@ -12,6 +12,7 @@ $patterns = @(
     "alerts.option_flow_daemon",
     "alerts.tick_recorder",
     "alerts.index_1m_intraday",
+    "alerts.vp_paper_executor",
     "viewer.live_server"
     # NOTE: alerts.vp_paper_journal is one-shot — no need to kill
 )
