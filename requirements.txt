@@ -1,11 +1,19 @@
 # Hawala v2 — Python dependencies
 # Generated 2026-05-23 for cross-platform install (Mac + Windows)
-# Install:  pip install -r requirements.txt
+#
+# IMPORTANT (Windows): Do NOT run `pip install -r requirements.txt` directly.
+# Use the wrapper: .\windows\install_deps.ps1
+#
+# Why: `growwapi` pins `numpy<2.0`. Anaconda Python 3.13 ships numpy 2.x.
+# Pip's resolver tries to downgrade → source build → no MSVC → fail.
+# The wrapper installs growwapi --no-deps FIRST, then this file resolves
+# cleanly using Anaconda's existing numpy 2.x.
+#
+# growwapi is intentionally NOT in this file. The wrapper handles it.
 
 beautifulsoup4>=4.12
 fastapi>=0.110
 feedparser>=6.0
-growwapi>=0.1
 jinja2>=3.1
 lxml>=4.9
 matplotlib>=3.8
