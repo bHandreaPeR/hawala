@@ -9,23 +9,38 @@
 
 ---
 
-## 0. Where production runs (post 2026-05-23 migration)
+## 0. Where production runs
 
-**Production runs on Windows.** Mac is dev-only now.
+**Production runs on Mac.** Windows migration was attempted 23-25 May 2026
+and **reverted** on Monday 25 May after a corrupt Anaconda install on
+Windows blocked all production tasks. Mac is the canonical execution host.
 
 | Machine | Role |
 |---|---|
-| **Windows (LAPTOP-JJOUAFCP, 192.168.0.6)** | All 17 scheduled tasks fire here. The "production box". Anaconda at `D:\anaconda3\`, repo at `D:\Hawala\Hawala v2`. |
-| **Mac** | Dev only. Project Iris crons still run. Hawala SSH heartbeat (launchd `com.hawala.winheartbeat`) checks Windows every 10 min → MACRO bot alert if DOWN ≥20 min. |
+| **Mac (Subhransus-MacBook-Pro-2)** | Production. All Hawala crons fire here. Project Iris crons also here. |
+| **Windows (LAPTOP-JJOUAFCP, 192.168.0.6)** | DEAD for Hawala. Anaconda corrupted, broken folder at `D:\anaconda3_broken_*`. Repo clone at `D:\Hawala\Hawala v2` is fine but unused. Reusable if we ever retry the migration with proper cleanup. |
 
-Mac→Windows over SSH (`hawala-win` alias, ed25519 key, LocalForward 8765 for the
-live viewer). Single `main` branch on `bHandreaPeR/hawala` on GitHub.
+Mac cron list (see `crontab -l`):
+- 06:55 autoheal, 07:25 healthcheck, 07:32 daily_report (Newsletter)
+- 09:00 news.runner
+- 09:11 index_1m_intraday
+- 09:12 v3 NIFTY + BANKNIFTY + vp_live_daemon + option_flow_daemon + tick_recorder + vp_paper_executor
+- 09:13 viewer.live_server
+- 16:30 daily_fetch.sh, 16:35 vp_paper_journal
+- 03:30 pkill all daemons
+- Fri 18:00 weekly_report, Sun 02:30 weekly_backfill
+- Project Iris crons preserved (separate project)
 
-17 scheduled tasks live in `windows/scheduled_tasks/*.xml`. Regenerate via
-`python windows/generate_tasks.py`. Re-import via `windows/IMPORT_TASKS.ps1`
-(Administrator PowerShell).
+Single `main` branch on `bHandreaPeR/hawala` on GitHub.
 
-See: `docs/WINDOWS_MIGRATION.md` for full migration plan + rollback.
+The Windows-migration artifacts (`windows/`, `docs/WINDOWS_MIGRATION.md`)
+remain in the repo as documentation. Not active. Do not invoke
+`windows/IMPORT_TASKS.ps1` unless you're explicitly redoing the migration
+with a known-good Anaconda install + Defender exclusion in place.
+
+The Mac→Windows SSH heartbeat (launchd `com.hawala.winheartbeat`) was
+**unloaded** on 25-May. State file at `~/.hawala_win_heartbeat.json` no
+longer updates. Re-enable only if Windows comes back online as production.
 
 ---
 

@@ -1,12 +1,25 @@
 # Hawala — Roadmap & Open Action Items
 
-*Last updated: 2026-05-23 (post-migration + heartbeat)*
+*Last updated: 2026-05-25 — Windows migration REVERTED. Mac is production.*
 
 This is the working punch-list. Items roll off as they ship.
 
 ---
 
-## ✅ Shipped this week (May 18–23)
+## ⚠️ Windows migration reverted (May 25 2026)
+
+After two days running on Windows, Anaconda on `D:\anaconda3` corrupted
+overnight (every .exe became a 0-byte stub). Couldn't be salvaged in time;
+production switched back to Mac mid-day Mon 25 May. The `windows/` subtree
++ `docs/WINDOWS_MIGRATION.md` stay in repo as reference, not active.
+
+**If we ever retry**: clean Anaconda uninstall + Defender exclusion BEFORE
+install + use D: but with `D:\anaconda` not `D:\anaconda3` (avoid the
+Microsoft Store python.exe filename alias conflict).
+
+---
+
+## ✅ Shipped this month
 
 1. **Footprint pipeline** — tick_recorder, index_1m_intraday, footprint.py builder, live viewer (FastAPI + Plotly.js), live DOM pane, session vol profile
 2. **VP-Trail paper journal** (`alerts/vp_paper_journal.py`) — daily 16:35 cron, journal CSV + TRADE-bot Telegram daily P&L
