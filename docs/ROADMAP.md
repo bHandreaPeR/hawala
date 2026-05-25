@@ -52,16 +52,43 @@ Microsoft Store python.exe filename alias conflict).
 
 ## 🔵 Open — medium priority
 
+### Fix v3 runner gate-alert Telegram parse errors
+Both `runner_nifty.py` and `runner_banknifty.py` emit gate-block alerts
+(VOL_GATE for NIFTY, REGIME_GATE for BANKNIFTY) that Telegram rejects
+with HTTP 400 "Unsupported start tag at byte 92/101". Probably the alert
+message uses `|` separators or em-dashes that, when sent with
+`parse_mode=HTML`, get interpreted as unclosed tags. Fix: either escape
+< / > / & in those alert strings, or switch the gate alerts to plain
+text (parse_mode=None). Non-blocking — alerts still get attempted, just
+fail at Telegram. Cosmetic but loud in logs.
+
+Forensic: 2026-05-25 NIFTY vol-gate alert (`logs/trade_bot/runner_nifty.log`)
+and BANKNIFTY regime-gate alert both produced this same 400.
+
+### Retry Windows migration (parked, requires clean prep)
+The 23-25 May attempt failed because legacy C:\anaconda3 artifacts
+collided with the new D:\anaconda3 install. Retry only if these steps
+are followed in order:
+1. Disable Microsoft Store python.exe / python3.exe App Execution Aliases
+   via Settings BEFORE installing Anaconda
+2. Wipe HKLM:\SOFTWARE\Python, HKCU:\SOFTWARE\Python, HKLM:\SOFTWARE\Anaconda*
+3. Strip all *anaconda* and *python* entries from PATH (Machine + User)
+4. Add Defender exclusion `D:\anaconda` BEFORE install
+5. Install to `D:\anaconda` (no `3`) to avoid Store-alias filename match
+6. UNCHECK "Register Anaconda as default Python" during install
+7. Verify python.exe is a real PE: `[IO.File]::ReadAllBytes(...).Length > 100000`
+
 ### Log redirection for 7 one-shot tasks
 Most daemons have their own loggers writing to `logs/trade_bot/*.log`. These 7 don't and rely on Task Scheduler History:
 - Hawala-DailyReport, Autoheal, Healthcheck, DailyFetch, VPPaperJournal, WeeklyReport, WeeklyBackfill
 
 Fix: wrap each task command in `cmd.exe /c "python script.py >> logs\reports\<name>-%date%.log 2>&1"`. Edit generate_tasks.py, regenerate XMLs, re-import.
 
-### Off-LAN access for viewer + SSH
-Currently both require Mac and Windows on same Wi-Fi.
-- **Tailscale** install on both machines. 5-min one-time setup. Free for ≤3 devices.
-- Once installed: SSH and viewer URL work from anywhere.
+### Off-LAN access for viewer
+Mac is production now. To view from a phone or another laptop:
+- Change `viewer.live_server` cron to bind `0.0.0.0` instead of `127.0.0.1`
+- OR install Tailscale on phone + Mac for off-LAN access
+- Either way: bookmark `http://<mac-ip>:8765/` on the secondary device
 
 ### Telegram health summary on TRADE bot
 Every Friday EOD, send a Telegram with the week's tally:
@@ -76,6 +103,12 @@ Every Friday EOD, send a Telegram with the week's tally:
 
 ### Branch hygiene
 - `main` is currently the only branch. Going forward: develop on feat branches, merge to main, delete feat branch immediately. No more multi-branch sprawl.
+
+### Mac sleep prevention (waking for crons)
+The 19-May incident: Mac slept overnight, missed 06:55–09:13 crons. The
+quick fix is `sudo pmset -a sleep 0` + lid open + plugged in. Long-term
+fix is `sudo pmset repeat wakeorpoweron MTWRF 06:30:00` so Mac
+auto-wakes for crons even if lid closed. Document in CONTEXT.md.
 
 ### F6 veto evaluation (option_flow)
 - After 2-3 weeks of v3 trades with current option_flow conviction logging, evaluate whether to wire the F6 veto signal into entries.
