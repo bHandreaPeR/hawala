@@ -23,6 +23,17 @@ html, body { margin: 0; padding: 0; height: 100%;
 .status { color: #80cbc4; font-size: 11px; margin-top: 12px; }
 .status.err { color: #ef9a9a; }
 
+.btn-sm { padding: 4px 7px; font-size: 11px; min-width: 26px; }
+.zoom-group { display: inline-flex; align-items: center; gap: 2px;
+  margin-top: 12px; padding: 0 4px; border: 1px solid #3d4754; border-radius: 3px;
+  background: #262d37; }
+.zoom-group .btn-sm { margin-top: 0; border: none; background: transparent;
+  color: #cdd; }
+.zoom-group .btn-sm:hover { background: #384353; }
+.zoom-lbl { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: #80cbc4; min-width: 32px; text-align: center;
+  user-select: none; }
+
 main { height: calc(100vh - 96px); padding: 0; }
 #chart { width: 100%; height: 100%; }
 
@@ -31,3 +42,70 @@ main { height: calc(100vh - 96px); padding: 0; }
   display: flex; gap: 18px; border-top: 1px solid #111;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .bottombar span { white-space: nowrap; }
+
+/* ── Unified positioning bar (floats at bottom-right of chart area) ────── */
+/* Sits in the right ~27 % of the chart, which is empty under the BS-summary
+   and DOM panes — NOT over the Δ-qty histogram (which only spans the left
+   72 %). Wraps to multiple rows when the right column is narrower than the
+   cards demand; height grows accordingly. */
+main { position: relative; }
+.pos-panel {
+  position: absolute;
+  bottom: 8px; right: 8px;
+  left: auto; top: auto;
+  /* Confine to the chart's right-side empty column. Chart x-domain for the
+     candle/BS/DOM panes ends at right=0; the delta histogram only occupies
+     x ∈ [0, 0.72] of the chart. The right 28 % is free below DOM. */
+  max-width: calc(28% - 16px);
+  padding: 6px 10px 8px;
+  background: rgba(32, 38, 46, 0.94); color: #f0f0f0;
+  border: 1px solid #3d4754; border-radius: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  z-index: 100;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.pos-title { font-size: 9px; letter-spacing: 1.4px; color: #aab;
+  text-align: left; }
+.pos-cards {
+  display: flex; flex-direction: row;
+  flex-wrap: wrap; gap: 6px;
+  align-items: stretch; justify-content: flex-end;
+}
+.pos-card {
+  background: #2d3540; border-left: 3px solid #555;
+  padding: 4px 7px; border-radius: 2px;
+  flex: 0 1 90px;          /* baseline 90px, shrinkable but not stretching */
+  min-width: 80px; max-width: 110px;
+  transition: background-color 0.3s, border-color 0.3s;
+}
+.pos-card.bull   { border-left-color: #26a69a; background: rgba(38,166,154,0.16); }
+.pos-card.bear   { border-left-color: #ef5350; background: rgba(239,83,80,0.16); }
+.pos-card.flat   { border-left-color: #555;    background: #2d3540; }
+.pos-card#pos_composite {
+  border-left-width: 4px;
+  flex: 0 1 115px; min-width: 100px; max-width: 130px;
+  order: 99;                       /* always last in the wrap order */
+  border-left-color: #ffb300;
+  background: rgba(255,179,0,0.08);
+}
+.pos-card#pos_composite.bull { background: rgba(38,166,154,0.20); }
+.pos-card#pos_composite.bear { background: rgba(239,83,80,0.20); }
+.pos-card#pos_composite.aligned { box-shadow: 0 0 0 1.5px #ffb300 inset; }
+.pos-label { font-size: 9px; letter-spacing: 0.8px; color: #aab;
+  white-space: nowrap; }
+.pos-help { color: #667; cursor: help; font-weight: bold; margin-left: 2px; }
+.pos-value { font-size: 15px; font-weight: 600; color: #f0f0f0;
+  margin-top: 1px; line-height: 1.1; }
+.pos-card#pos_composite .pos-value { font-size: 20px; }
+.pos-card.bull .pos-value { color: #80cbc4; }
+.pos-card.bear .pos-value { color: #ef9a9a; }
+/* Allow .pos-sub to wrap onto a 2nd / 3rd line instead of being clipped. */
+.pos-sub { font-size: 10px; color: #98a; margin-top: 1px;
+  white-space: normal; word-break: break-word;
+  line-height: 1.25; overflow: visible; }
+.pos-foot { font-size: 9px; color: #667; text-align: right;
+  font-style: italic; }
+
+/* Keep the panel above the fixed bottom bar */
+.pos-panel { bottom: 36px; }

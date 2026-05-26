@@ -17,18 +17,42 @@
 const TF_MS = {'1min': 60000, '3min': 180000, '5min': 300000, '15min': 900000};
 const IMB_MULT = 3, IMB_MIN_TICKS = 4;
 
+// At zoom 1.0 the chart shows ALL available candles (no pre-09:15 padding)
+// and Plotly auto-fits the y-range to visible-candle highs/lows. Zoom > 1.0
+// progressively focuses on recent activity around the latest close.
+const X_TICK_LABEL_EVERY = {'1min': 5, '3min': 2, '5min': 1, '15min': 1}; // every Nth gridline gets a label
+
+// Zoom factors: zoom_x > 1 = fewer candles visible (zoomed IN on time).
+//                zoom_y > 1 = fewer cells visible (zoomed IN on price).
+// Independent per-axis, persisted to localStorage so reloads keep the view.
+const ZOOM_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+const _stored = (k, d) => {
+  const v = parseFloat(localStorage.getItem(k));
+  return Number.isFinite(v) && ZOOM_STEPS.includes(v) ? v : d;
+};
+
 const state = {
   cfg: null, inst: null, tf: '5min', cell_size: 5, date: null,
   paused: false, autoscroll: true,
+  zoom_x: _stored('hawala_zoom_x', 1.0),
+  zoom_y: _stored('hawala_zoom_y', 1.0),
   snap: null,
   cells_idx: new Map(),    // key = `${bucket_ms}|${cell}`
   candles_idx: new Map(),  // key = bucket_ms
-  ws: null, ws_url: null,
+  ws: null, ws_url: null, ws_seq: 0,        // ws_seq: ignore msgs from stale sockets
   dirty: false, n_ticks: 0,
   last_byte: 0,
   depth: {ts_ms: 0, bids: [], asks: []},   // live top-5 resting orders
   depth_dirty: false,
+  dom_profile: {cells: [], n_snapshots: 0}, // session-wide resting profile
+  positioning: null,                         // unified positioning snapshot
+  positioning_timer: null,
+  resync_timer: null,                       // periodic running-bucket resync
 };
+
+// How often the running-bucket re-syncs against the authoritative server
+// snapshot. Belt-and-suspenders against WS double-counting.
+const RESYNC_MS = 5000;
 
 // ─── DOM bootstrap ──────────────────────────────────────────────────────────
 async function bootstrap () {
@@ -74,8 +98,49 @@ async function bootstrap () {
   });
   document.getElementById('reload').addEventListener('click', fullReload);
 
+  // ── Zoom buttons ──────────────────────────────────────────────────────
+  const stepZoom = (axis, dir) => {
+    const cur = axis === 'x' ? state.zoom_x : state.zoom_y;
+    const idx = ZOOM_STEPS.indexOf(cur);
+    const ni  = Math.max(0, Math.min(ZOOM_STEPS.length - 1,
+                  (idx < 0 ? ZOOM_STEPS.indexOf(1.0) : idx) + dir));
+    const nv  = ZOOM_STEPS[ni];
+    if (axis === 'x') state.zoom_x = nv; else state.zoom_y = nv;
+    localStorage.setItem(`hawala_zoom_${axis}`, String(nv));
+    updateZoomLabels();
+    state.dirty = true;     // trigger redraw
+  };
+  document.getElementById('zoom_x_in' ).addEventListener('click', () => stepZoom('x',  1));
+  document.getElementById('zoom_x_out').addEventListener('click', () => stepZoom('x', -1));
+  document.getElementById('zoom_y_in' ).addEventListener('click', () => stepZoom('y',  1));
+  document.getElementById('zoom_y_out').addEventListener('click', () => stepZoom('y', -1));
+  document.getElementById('zoom_reset').addEventListener('click', () => {
+    state.zoom_x = state.zoom_y = 1.0;
+    localStorage.setItem('hawala_zoom_x', '1');
+    localStorage.setItem('hawala_zoom_y', '1');
+    updateZoomLabels();
+    state.dirty = true;
+  });
+  // Keyboard shortcuts: +/- = price zoom, [/] = time zoom, 0 = reset
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    if (e.key === '+' || e.key === '=') stepZoom('y',  1);
+    else if (e.key === '-' || e.key === '_') stepZoom('y', -1);
+    else if (e.key === ']') stepZoom('x',  1);
+    else if (e.key === '[') stepZoom('x', -1);
+    else if (e.key === '0') document.getElementById('zoom_reset').click();
+  });
+  updateZoomLabels();
+
   await fullReload();
   startRedrawLoop();
+}
+
+function updateZoomLabels () {
+  const xl = document.getElementById('zoom_x_lbl');
+  const yl = document.getElementById('zoom_y_lbl');
+  if (xl) xl.textContent = 'x' + state.zoom_x.toFixed(state.zoom_x < 1 ? 2 : 1);
+  if (yl) yl.textContent = 'y' + state.zoom_y.toFixed(state.zoom_y < 1 ? 2 : 1);
 }
 
 function rebuildCellChoices () {
@@ -95,7 +160,15 @@ function rebuildCellChoices () {
 // ─── Full reload (snapshot + reopen WS) ─────────────────────────────────────
 async function fullReload () {
   setStatus('loading snapshot…');
-  if (state.ws) { try { state.ws.close(); } catch(e){} state.ws = null; }
+  // Hard-close the old WS BEFORE we bump ws_seq so the close handler can't
+  // race a reconnect onto the new generation.
+  if (state.ws) {
+    try { state.ws.onclose = null; state.ws.close(); } catch(e){}
+    state.ws = null;
+  }
+  state.ws_seq += 1;                            // invalidate any in-flight msgs
+  if (state.resync_timer) { clearInterval(state.resync_timer); state.resync_timer = null; }
+
   const q = new URLSearchParams({inst: state.inst, date: state.date,
                                  tf: state.tf, cell: state.cell_size});
   state.snap = await fetch('/snapshot?' + q).then(r => r.json());
@@ -104,6 +177,96 @@ async function fullReload () {
   redrawAll();
   setStatus('live ✓');
   openWS();
+  // Belt-and-suspenders: every RESYNC_MS, re-fetch /snapshot for the running
+  // bucket only and overwrite local cells/candle for that bucket. Even if WS
+  // double-counts, the in-progress candle never drifts more than 5s from truth.
+  state.resync_timer = setInterval(resyncRunningBucket, RESYNC_MS);
+
+  // Positioning sidebar — poll every 5 s on the same cadence
+  if (state.positioning_timer) { clearInterval(state.positioning_timer); }
+  fetchPositioning();
+  state.positioning_timer = setInterval(fetchPositioning, RESYNC_MS);
+}
+
+async function fetchPositioning () {
+  try {
+    const q = new URLSearchParams({inst: state.inst, date: state.date});
+    const r = await fetch('/positioning?' + q).then(r => r.json());
+    if (r && !r.error) {
+      state.positioning = r;
+      renderPositioning(r);
+    }
+  } catch (e) { /* ignore — next tick retries */ }
+}
+
+function renderPositioning (p) {
+  const apply = (id, c) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove('bull', 'bear', 'flat');
+    el.classList.add(c.dir > 0 ? 'bull' : c.dir < 0 ? 'bear' : 'flat');
+    el.querySelector('.pos-value').textContent =
+      (c.value > 0 ? '+' : '') + c.value.toFixed(2);
+    el.querySelector('.pos-sub').textContent = c.label || '—';
+  };
+  apply('pos_flow',         p.flow);
+  apply('pos_resting',      p.resting);
+  apply('pos_institutions', p.institutions);
+  apply('pos_macro',        p.macro);
+  apply('pos_composite',    p.composite);
+
+  // When all four components point the same non-flat direction, highlight
+  // the composite card with a gold halo — that's the "all aligned" moment.
+  const comp = document.getElementById('pos_composite');
+  comp.classList.toggle('aligned', !!p.composite.aligned);
+
+  // Extra context on individual cards
+  document.querySelector('#pos_flow .pos-sub').textContent =
+    `${p.flow.label} · ${p.flow.n_ticks}t`;
+  document.querySelector('#pos_resting .pos-sub').textContent =
+    `${p.resting.label} · b${fmtNum(p.resting.bid_qty)}/a${fmtNum(p.resting.ask_qty)}`;
+  document.querySelector('#pos_institutions .pos-sub').textContent =
+    `${p.institutions.label} · conv ${p.institutions.conv.toFixed(2)}`;
+  document.querySelector('#pos_macro .pos-sub').textContent =
+    `${p.macro.label} · conf ${(p.macro.confidence*100).toFixed(0)}%`;
+
+  document.getElementById('pos_updated').textContent =
+    `updated ${new Date().toLocaleTimeString()}`;
+}
+
+async function resyncRunningBucket () {
+  if (state.paused) return;
+  try {
+    const q = new URLSearchParams({inst: state.inst, date: state.date,
+                                   tf: state.tf, cell: state.cell_size});
+    const fresh = await fetch('/snapshot?' + q).then(r => r.json());
+    if (!fresh || !fresh.candles || fresh.candles.length === 0) return;
+    // Identify the latest (running) bucket from server truth.
+    const latestBk = Math.max(...fresh.candles.map(c => c.bucket));
+    // Replace cells for this bucket with server values (drop existing).
+    state.snap.cells = state.snap.cells.filter(c => c.bucket !== latestBk);
+    for (const c of fresh.cells) {
+      if (c.bucket === latestBk) {
+        state.snap.cells.push(c);
+        state.cells_idx.set(`${c.bucket}|${c.cell}`, c);
+      }
+    }
+    // Replace candle for this bucket
+    const fc = fresh.candles.find(k => k.bucket === latestBk);
+    if (fc) state.candles_idx.set(latestBk, fc);
+    // Drop any stale cell-index entries for this bucket that no longer exist
+    for (const key of [...state.cells_idx.keys()]) {
+      const [bk] = key.split('|');
+      if (Number(bk) === latestBk &&
+          !state.snap.cells.find(c => `${c.bucket}|${c.cell}` === key)) {
+        state.cells_idx.delete(key);
+      }
+    }
+    state.dirty = true;
+    // Refresh the session DOM profile on the same 5s cadence — the running
+    // candle and the resting-order picture stay in lockstep with truth.
+    fetchDomProfile();
+  } catch (e) { /* network blips are fine, next tick will retry */ }
 }
 
 function rebuildIndex () {
@@ -119,22 +282,31 @@ function rebuildIndex () {
 
 // ─── WebSocket — tail new ticks, patch state ────────────────────────────────
 function openWS () {
+  // Capture the generation this socket belongs to. Any message arriving
+  // after a fullReload (which bumps ws_seq) is silently ignored.
+  const mySeq = state.ws_seq;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   state.ws_url = `${proto}://${location.host}/ws?inst=${state.inst}&date=${state.date}`;
   const ws = new WebSocket(state.ws_url);
   state.ws = ws;
   document.getElementById('ws_state').textContent = 'ws: connecting';
   ws.addEventListener('open',  () => {
+    if (mySeq !== state.ws_seq) return;
     document.getElementById('ws_state').textContent = 'ws: ✓ open';
   });
   ws.addEventListener('close', () => {
+    if (mySeq !== state.ws_seq) return;        // stale — caller already reset
     document.getElementById('ws_state').textContent = 'ws: closed (retrying)';
-    if (!state.paused) setTimeout(openWS, 1500);
+    if (!state.paused) setTimeout(() => {
+      if (mySeq === state.ws_seq) openWS();
+    }, 1500);
   });
   ws.addEventListener('error', () => {
+    if (mySeq !== state.ws_seq) return;
     document.getElementById('ws_state').textContent = 'ws: err';
   });
   ws.addEventListener('message', ev => {
+    if (mySeq !== state.ws_seq) return;        // stale socket — drop msg
     if (state.paused) return;
     const m = JSON.parse(ev.data);
     // Defence 1: drop any message whose inst doesn't match the active symbol.
@@ -151,8 +323,23 @@ function openWS () {
   // Initial depth fetch — server pushes only on new ts; seed via REST.
   fetch(`/depth?inst=${state.inst}&date=${state.date}`)
     .then(r => r.json())
-    .then(d => { state.depth = d; state.depth_dirty = true; })
+    .then(d => { if (mySeq === state.ws_seq) { state.depth = d; state.depth_dirty = true; } })
     .catch(() => {});
+
+  // Session-wide DOM profile — fetched once at WS open, refreshed by the
+  // 5-second resync loop alongside the running candle.
+  fetchDomProfile(mySeq);
+}
+
+async function fetchDomProfile (mySeq) {
+  try {
+    const q = new URLSearchParams({inst: state.inst, date: state.date,
+                                   cell: state.cell_size});
+    const r = await fetch('/dom_profile?' + q).then(r => r.json());
+    if (mySeq !== undefined && mySeq !== state.ws_seq) return;  // stale
+    state.dom_profile = r;
+    state.dirty = true;
+  } catch (e) { /* ignore */ }
 }
 
 // ─── Apply a batch of ticks to local state ──────────────────────────────────
@@ -359,8 +546,35 @@ function redrawAll () {
       fillcolor:'rgba(0,0,0,0)', line:{width:1.5, color:'#fdd835'}});
   }
 
-  const xRange = [candles[0].bucket - tf_ms*0.6,
-                  candles[candles.length-1].bucket + tf_ms*0.6];
+  // ── Visible window (data-driven, no synthetic padding) ─────────────────
+  // x: at zoom 1.0 show every actual candle (no pre-09:15 blanks). Zoom > 1
+  // narrows to the most recent slice. Clamped so we always see ≥6 candles.
+  const lastBk  = candles[candles.length-1].bucket;
+  const firstBk = candles[0].bucket;
+  const visCandles = Math.max(6, Math.round(candles.length / state.zoom_x));
+  const startBk = state.autoscroll
+    ? Math.max(firstBk, lastBk - (visCandles - 1) * tf_ms)
+    : firstBk;
+  const xRange = [startBk - tf_ms * 0.5, lastBk + tf_ms * 0.5];
+
+  // y: auto-fit to visible candles' highs/lows. Zoom_y contracts that span
+  // around the latest close → broker-style price-axis zoom.
+  const visibleCandles = candles.filter(c => c.bucket >= startBk);
+  const yLo0 = Math.min(...visibleCandles.map(c => c.low));
+  const yHi0 = Math.max(...visibleCandles.map(c => c.high));
+  const yMid = candles[candles.length-1].close;
+  const yHalfSpan = ((yHi0 - yLo0) / 2 + 2 * cs) / state.zoom_y;
+  const yRange = [yMid - yHalfSpan, yMid + yHalfSpan];
+
+  // y-tick density: aim for ~10 labels regardless of cell size / zoom.
+  // Round step to the nearest "nice" multiple of cell size.
+  const ySpan = yRange[1] - yRange[0];
+  const rawStep = ySpan / 10;
+  const niceMults = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500];
+  let yDtick = cs;
+  for (const m of niceMults) {
+    if (m * cs >= rawStep) { yDtick = m * cs; break; }
+  }
 
   // ── Right-pane #1 — Live DOM (resting top-5 bids/asks) ──────────────────
   const dom = state.depth || {bids:[], asks:[]};
@@ -377,6 +591,48 @@ function redrawAll () {
   // text labels — show qty on each bar
   const bidLabels = dom.bids.map(b => `${b.qty}`);
   const askLabels = dom.asks.map(a => `${a.qty}`);
+
+  // ── Session DOM profile — mean resting qty per price level over the day.
+  // Plotted as faint background bars BEHIND the live top-5 in the same pane:
+  // bars further from zero = bigger walls; persistent levels (high % of
+  // snapshots) get higher opacity. Outline highlight on the very top
+  // walls so the eye lands on real liquidity nodes.
+  const profCells = (state.dom_profile && state.dom_profile.cells) || [];
+  // Find the largest walls so we can highlight the top-N
+  const allWalls = profCells.flatMap(c => [
+    {side:'bid', px:c.cell, qty:c.mean_bid_qty, persist:c.bid_persistence},
+    {side:'ask', px:c.cell, qty:c.mean_ask_qty, persist:c.ask_persistence},
+  ]).filter(w => w.qty > 0);
+  const wallMax = Math.max(1, ...allWalls.map(w => w.qty));
+  // Top-3 walls each side: ones we annotate with a label + outline
+  const topBidWalls = [...allWalls].filter(w => w.side === 'bid')
+                       .sort((a,b) => b.qty - a.qty).slice(0, 3);
+  const topAskWalls = [...allWalls].filter(w => w.side === 'ask')
+                       .sort((a,b) => b.qty - a.qty).slice(0, 3);
+  const isTopBid = new Set(topBidWalls.map(w => w.px));
+  const isTopAsk = new Set(topAskWalls.map(w => w.px));
+
+  const sessBidPx = profCells.map(c => c.cell);
+  const sessBidQ  = profCells.map(c => c.mean_bid_qty);
+  const sessAskPx = profCells.map(c => c.cell);
+  const sessAskQ  = profCells.map(c => -c.mean_ask_qty);
+  // Opacity ∝ persistence: a level present in 50%+ of snapshots looks
+  // solid; an ephemeral one fades back. Plus a tiny floor so 1-2% levels
+  // still draw something.
+  const sessBidColors = profCells.map(c =>
+    `rgba(38,166,154,${(0.10 + 0.55 * Math.min(1, c.bid_persistence * 1.5)).toFixed(2)})`);
+  const sessAskColors = profCells.map(c =>
+    `rgba(239,83,80,${(0.10 + 0.55 * Math.min(1, c.ask_persistence * 1.5)).toFixed(2)})`);
+  // Outline highlight on top walls
+  const sessBidLine = profCells.map(c =>
+    isTopBid.has(c.cell) ? {color:'#0d6e63', width:1.5} : {width:0});
+  const sessAskLine = profCells.map(c =>
+    isTopAsk.has(c.cell) ? {color:'#b71c1c', width:1.5} : {width:0});
+  // Labels: only on the top-3 walls each side to keep the pane readable
+  const sessBidLabels = profCells.map(c =>
+    isTopBid.has(c.cell) ? fmtNum(c.mean_bid_qty) : '');
+  const sessAskLabels = profCells.map(c =>
+    isTopAsk.has(c.cell) ? fmtNum(c.mean_ask_qty) : '');
 
   // ── Right-pane #2 — Session profile (rebuild from cells) ────────────────
   const profByCell = new Map();
@@ -400,18 +656,41 @@ function redrawAll () {
   const dy = candles.map(k => k.delta_qty);
   const dcol = dy.map(v => v >= 0 ? '#26a69a' : '#ef5350');
 
+  // Stride x-tick labels so a dense tf stays readable. When zoomed in to ≤20
+  // candles we label every one.
+  let xLabelStride = X_TICK_LABEL_EVERY[state.tf] || 1;
+  if (visCandles <= 20) xLabelStride = 1;
+
   const layout = {
     paper_bgcolor:'#fafafa', plot_bgcolor:'#fff',
-    margin:{l:55, r:15, t:25, b:30},
+    margin:{l:55, r:15, t:25, b:42},
     showlegend:false,
-    // domains: main=72%, session profile=12%, live DOM=14% (right edge)
-    xaxis:  {type:'date', domain:[0, 0.72], range:xRange, title:''},
-    yaxis:  {domain:[0.27, 1], title:'price', side:'left'},
-    xaxis2: {domain:[0.73, 0.84], anchor:'y2', showticklabels:false, title:'session vol'},
+    // domains: main=72%, session profile=12%, live DOM=14% (right edge).
+    // Delta-pane (xaxis3) shares the [0, 0.72] domain → time stamps line up
+    // vertically with the candles directly above.
+    xaxis:  {type:'date', domain:[0, 0.72], range:xRange,
+             dtick: tf_ms * xLabelStride, tickformat:'%H:%M', tick0: lastBk,
+             gridcolor:'#eef0f2', gridwidth:1, showspikes:false},
+    yaxis:  {domain:[0.27, 1], title:'price', side:'left', range:yRange,
+             dtick: yDtick, tickformat:',d',
+             gridcolor:'#eef0f2', gridwidth:1},
+    // Session BS-summary pane — show qty labels at bottom so user knows scale
+    xaxis2: {domain:[0.73, 0.84], anchor:'y2', title:'BS qty',
+             showticklabels:true, tickfont:{size:9}, nticks:3,
+             gridcolor:'#eef0f2'},
     yaxis2: {domain:[0.27, 1], matches:'y', showticklabels:false},
-    xaxis3: {type:'date', domain:[0, 1], anchor:'y3', range:xRange, title:''},
-    yaxis3: {domain:[0, 0.22], title:'Δ qty'},
-    xaxis4: {domain:[0.86, 1.0], anchor:'y4', showticklabels:false, title:'live DOM'},
+    // Delta pane — SAME x-domain + range + dtick as the candle pane so
+    // timestamps line up pixel-perfect underneath each candle.
+    xaxis3: {type:'date', domain:[0, 0.72], range:xRange, anchor:'y3',
+             dtick: tf_ms * xLabelStride, tickformat:'%H:%M', tick0: lastBk,
+             gridcolor:'#eef0f2', showticklabels:true, tickfont:{size:9}},
+    yaxis3: {domain:[0, 0.22], title:'Δ qty', gridcolor:'#eef0f2',
+             tickfont:{size:9}, nticks:4},
+    // Live DOM + session profile pane — show qty labels
+    xaxis4: {domain:[0.86, 1.0], anchor:'y4', title:'DOM (live + session)',
+             showticklabels:true, tickfont:{size:9}, nticks:3,
+             zeroline:true, zerolinecolor:'#999', zerolinewidth:1,
+             gridcolor:'#eef0f2'},
     yaxis4: {domain:[0.27, 1], matches:'y', showticklabels:false},
     shapes, annotations: annos,
     barmode:'overlay',
@@ -425,34 +704,75 @@ function redrawAll () {
         Math.max(...candles.map(c=>c.high)) + 1.5*cs],
      mode:'markers', marker:{size:0.1, color:'rgba(0,0,0,0)'},
      hoverinfo:'skip', xaxis:'x', yaxis:'y'},
-    // session profile (pane #2)
+    // session profile (pane #2) — sell side (left of axis, negative x)
     {x: profSell, y: profY, type:'bar', orientation:'h',
      xaxis:'x2', yaxis:'y2',
      marker:{color:'rgba(239,83,80,0.85)'},
+     text: prof.map(p => fmtNum(profUseQty ? p.sell_qty : p.sell_ticks)),
+     textposition:'outside', cliponaxis:false,
+     textfont:{size:9, color:'#b71c1c'},
      hovertemplate:'price=%{y}<br>sell=%{x:.0f}<extra></extra>'},
+    // session profile (pane #2) — buy side (right of axis, positive x)
     {x: profBuy,  y: profY, type:'bar', orientation:'h',
      xaxis:'x2', yaxis:'y2',
      marker:{color:'rgba(38,166,154,0.85)'},
+     text: prof.map(p => fmtNum(profUseQty ? p.buy_qty : p.buy_ticks)),
+     textposition:'outside', cliponaxis:false,
+     textfont:{size:9, color:'#0d6e63'},
      hovertemplate:'price=%{y}<br>buy=%{x:.0f}<extra></extra>'},
-    // delta histogram (bottom pane)
+    // delta histogram (bottom pane) — numeric labels on top of positive bars,
+    // bottom of negative bars (Plotly's 'outside' handles this automatically).
     {x: dx, y: dy, type:'bar', marker:{color: dcol},
      xaxis:'x3', yaxis:'y3',
+     text: dy.map(v => fmtNum(Math.abs(v))),
+     textposition:'outside', cliponaxis:false,
+     textfont:{size:9, color:'#333'},
      hovertemplate:'%{x}<br>Δ=%{y:.0f}<extra></extra>'},
-    // live DOM (pane #3) — bids on right side of axis, asks on left
+    // ─ Session DOM profile (drawn FIRST so live top-5 lands on top) ──────
+    // Faint full-day mean resting qty bars. Top-3 walls each side get
+    // outlines + qty labels so genuine liquidity nodes are obvious.
+    {x: sessBidQ, y: sessBidPx, type:'bar', orientation:'h',
+     xaxis:'x4', yaxis:'y4', width: cs * 0.9,
+     marker:{color: sessBidColors, line: {color:'rgba(0,0,0,0)', width:0}},
+     hovertemplate:'session BID %{y}<br>mean qty=%{x:.0f}<extra></extra>',
+     showlegend:false},
+    {x: sessAskQ, y: sessAskPx, type:'bar', orientation:'h',
+     xaxis:'x4', yaxis:'y4', width: cs * 0.9,
+     marker:{color: sessAskColors, line: {color:'rgba(0,0,0,0)', width:0}},
+     hovertemplate:'session ASK %{y}<br>mean qty=%{x:.0f}<extra></extra>',
+     showlegend:false},
+    // Outline+label overlay for the top-3 walls each side (drawn as a
+    // separate trace because Plotly bar `marker.line` doesn't accept arrays
+    // for orientation:'h' consistently across versions).
+    {x: profCells.map(c => isTopBid.has(c.cell) ? c.mean_bid_qty : 0),
+     y: profCells.map(c => c.cell),
+     type:'bar', orientation:'h', xaxis:'x4', yaxis:'y4', width: cs * 0.9,
+     marker:{color:'rgba(0,0,0,0)', line:{color:'#0d6e63', width:1.5}},
+     text: sessBidLabels, textposition:'outside', cliponaxis:false,
+     textfont:{size:9, color:'#0d6e63'},
+     hoverinfo:'skip', showlegend:false},
+    {x: profCells.map(c => isTopAsk.has(c.cell) ? -c.mean_ask_qty : 0),
+     y: profCells.map(c => c.cell),
+     type:'bar', orientation:'h', xaxis:'x4', yaxis:'y4', width: cs * 0.9,
+     marker:{color:'rgba(0,0,0,0)', line:{color:'#b71c1c', width:1.5}},
+     text: sessAskLabels, textposition:'outside', cliponaxis:false,
+     textfont:{size:9, color:'#b71c1c'},
+     hoverinfo:'skip', showlegend:false},
+    // ─ Live top-5 DOM (foreground, more saturated) ───────────────────────
     {x: domBidQ, y: domBidPx, type:'bar', orientation:'h',
-     xaxis:'x4', yaxis:'y4',
+     xaxis:'x4', yaxis:'y4', width: cs * 0.4,
      marker:{color: bidColors,
-             line:{color:'rgba(0,0,0,0.2)', width:0.5}},
+             line:{color:'#0d6e63', width:1.0}},
      text: bidLabels, textposition:'outside', cliponaxis:false,
      textfont:{size:10, color:'#0d6e63'},
-     hovertemplate:'BID %{y}<br>qty=%{x}<extra></extra>'},
+     hovertemplate:'LIVE BID %{y}<br>qty=%{x}<extra></extra>'},
     {x: domAskQ, y: domAskPx, type:'bar', orientation:'h',
-     xaxis:'x4', yaxis:'y4',
+     xaxis:'x4', yaxis:'y4', width: cs * 0.4,
      marker:{color: askColors,
-             line:{color:'rgba(0,0,0,0.2)', width:0.5}},
+             line:{color:'#b71c1c', width:1.0}},
      text: askLabels, textposition:'outside', cliponaxis:false,
      textfont:{size:10, color:'#b71c1c'},
-     hovertemplate:'ASK %{y}<br>qty=%{x:.0f}<extra></extra>'},
+     hovertemplate:'LIVE ASK %{y}<br>qty=%{x:.0f}<extra></extra>'},
   ];
 
   Plotly.react('chart', traces, layout, {responsive:true, displaylogo:false});

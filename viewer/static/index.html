@@ -29,12 +29,54 @@
       </label>
       <button id="pause" class="btn">⏸ Pause</button>
       <button id="autoscroll" class="btn btn-active">↦ Auto-scroll</button>
+      <span class="zoom-group" title="Time-axis zoom">
+        <button id="zoom_x_out" class="btn btn-sm">⇤</button>
+        <span id="zoom_x_lbl" class="zoom-lbl">x1.0</span>
+        <button id="zoom_x_in"  class="btn btn-sm">⇥</button>
+      </span>
+      <span class="zoom-group" title="Price-axis zoom">
+        <button id="zoom_y_out" class="btn btn-sm">⇣</button>
+        <span id="zoom_y_lbl" class="zoom-lbl">y1.0</span>
+        <button id="zoom_y_in"  class="btn btn-sm">⇡</button>
+      </span>
+      <button id="zoom_reset" class="btn btn-sm" title="Reset zoom">⊙</button>
       <button id="reload"  class="btn">⟳ Reload</button>
       <span id="status" class="status">connecting…</span>
     </div>
   </header>
   <main>
     <div id="chart"></div>
+    <aside id="positioning" class="pos-panel" title="Unified positioning view — flow / resting / institutions / macro">
+      <div class="pos-title">POSITIONING</div>
+      <div class="pos-cards">
+        <div class="pos-card" id="pos_flow">
+          <div class="pos-label">FLOW <span class="pos-help" title="Footprint CVD over last 15 min — where the aggressors traded">?</span></div>
+          <div class="pos-value">—</div>
+          <div class="pos-sub">—</div>
+        </div>
+        <div class="pos-card" id="pos_resting">
+          <div class="pos-label">RESTING <span class="pos-help" title="Live top-5 DOM imbalance — where the resting orders are stacked">?</span></div>
+          <div class="pos-value">—</div>
+          <div class="pos-sub">—</div>
+        </div>
+        <div class="pos-card" id="pos_institutions">
+          <div class="pos-label">INST <span class="pos-help" title="Option flow conviction from option_flow_daemon (OI deltas, PCR)">?</span></div>
+          <div class="pos-value">—</div>
+          <div class="pos-sub">—</div>
+        </div>
+        <div class="pos-card" id="pos_macro">
+          <div class="pos-label">MACRO <span class="pos-help" title="News signal direction × confidence (score from news/scorer.py)">?</span></div>
+          <div class="pos-value">—</div>
+          <div class="pos-sub">—</div>
+        </div>
+        <div class="pos-card" id="pos_composite">
+          <div class="pos-label">COMPOSITE</div>
+          <div class="pos-value">—</div>
+          <div class="pos-sub">waiting</div>
+        </div>
+      </div>
+      <div class="pos-foot" id="pos_updated">—</div>
+    </aside>
   </main>
   <footer class="bottombar">
     <span id="tick_counter">ticks: 0</span>

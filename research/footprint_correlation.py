@@ -29,8 +29,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 import sys; sys.path.insert(0, str(ROOT))
 
 from research.footprint_features import footprint_at
+from research.dom_features       import dom_at
 
 OUT = ROOT / 'trade_logs' / 'footprint_features.csv'
+DOM_LOOKBACK_MIN = 5     # tighter window than footprint — DOM persistence
+                         # only meaningful over short horizons
 
 
 # ─── v3 trade extraction from runner logs ────────────────────────────────────
@@ -148,33 +151,50 @@ def main() -> None:
         return
 
     enriched = []
-    n_with_data, n_skip = 0, 0
+    n_fp_data, n_dom_data, n_skip_fp, n_skip_dom = 0, 0, 0, 0
     for t in trades:
         fp = footprint_at(t['inst'], t['entry_ts'], lookback_min=args.lookback_min)
+        # Pass footprint's ltp_at_ts to dom_at so wall-distance is anchored to
+        # the actual print price, not the at-ts DOM mid (slightly different).
+        ltp = fp.get('ltp_at_ts')
+        dm = dom_at(t['inst'], t['entry_ts'],
+                    lookback_min=DOM_LOOKBACK_MIN, ltp=ltp)
         row = {**t}
         for k, v in fp.items():
             if k in ('inst', 'ts'):
                 continue
             row[f'fp_{k}'] = v
+        for k, v in dm.items():
+            if k in ('inst', 'ts', 'lookback_min'):
+                continue
+            # dom_at already prefixes its keys with 'dom_' — keep as-is
+            row[k] = v
         enriched.append(row)
-        if fp.get('data_available'):
-            n_with_data += 1
-        else:
-            n_skip += 1
+        if fp.get('data_available'):  n_fp_data  += 1
+        else:                          n_skip_fp  += 1
+        if dm.get('dom_data_available'): n_dom_data += 1
+        else:                            n_skip_dom += 1
 
     df = pd.DataFrame(enriched)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUT, index=False)
     print(f'  wrote {len(df)} rows to {OUT}')
-    print(f'  with footprint data: {n_with_data}  / skipped (no tick CSV): {n_skip}')
+    print(f'  with footprint data: {n_fp_data}  / skipped (no tick CSV):  {n_skip_fp}')
+    print(f'  with DOM data:       {n_dom_data}  / skipped (no depth CSV): {n_skip_dom}')
 
-    if n_with_data >= 5:
-        print('\n=== preview of features for trades WITH data ===')
+    if n_fp_data >= 5:
+        print('\n=== preview — footprint features ===')
         cols = ['inst','strategy','entry_ts','direction','pnl_rs','win',
                 'fp_cvd_direction','fp_imb_ratio','fp_n_stacked_imbalances',
                 'fp_poc_dist_pts','fp_last_bar_abs_ratio']
-        sub = df[df['fp_data_available']][cols].head(20)
-        print(sub.to_string(index=False))
+        print(df[df['fp_data_available']][cols].head(20).to_string(index=False))
+
+    if n_dom_data >= 5:
+        print('\n=== preview — DOM features ===')
+        cols = ['inst','strategy','entry_ts','direction','pnl_rs','win',
+                'dom_imbalance','dom_mean_imbalance','dom_imbalance_trend',
+                'dom_largest_wall_dist','dom_spread_pts','dom_max_refresh_count']
+        print(df[df['dom_data_available']][cols].head(20).to_string(index=False))
 
 
 if __name__ == '__main__':

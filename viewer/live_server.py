@@ -55,40 +55,67 @@ def _tick_path(inst: str, day: str) -> pathlib.Path:
     return CACHE_DIR / f'ticks_{inst}_{day.replace("-","")}.csv'
 
 
-def _read_ticks(inst: str, day: str, since_byte: int = 0
+_CSV_COLS = ['ts_ms','inst','price','qty','side','rule','bid','ask',
+             'bid_qty','ask_qty','spread','cum_volume']
+
+
+def _read_ticks(inst: str, day: str, since_byte: int
                 ) -> tuple[pd.DataFrame, int]:
-    """Read ticks from byte offset to EOF. Returns (df, new_byte_offset)."""
+    """Read NEW ticks from byte offset to last complete newline.
+
+    Important: NEVER replays the whole file. Caller is responsible for
+    initialising since_byte to a sane EOF on first call — if since_byte is
+    < 0 (sentinel for "uninitialised"), we just return (empty, current EOF)
+    so the next poll starts streaming from there.
+
+    Returns (df, new_byte_offset). new_byte_offset always points to the
+    byte AFTER the last complete row consumed — never mid-row — so the
+    next call resumes cleanly without dropping or duplicating rows.
+    """
     p = _tick_path(inst, day)
     if not p.exists():
-        return pd.DataFrame(), 0
+        # Preserve the uninitialised sentinel so when the file finally
+        # appears, we jump to its EOF instead of replaying everything.
+        return pd.DataFrame(), since_byte if since_byte < 0 else 0
     size = p.stat().st_size
-    if since_byte == 0:
-        df = pd.read_csv(p) if size > 0 else pd.DataFrame()
-        return df, size
+    # Sentinel: caller hasn't initialised. Don't replay history; just
+    # advance to current EOF and the next poll will stream genuinely new
+    # rows.
+    if since_byte < 0:
+        return pd.DataFrame(), size
     if since_byte >= size:
         return pd.DataFrame(), since_byte
-    # tail-read: skip-rows is the easier route — keeps schema clean
-    df = pd.read_csv(p)
-    # offset is on bytes, not rows. We can re-read the whole file and dedup
-    # against the WS-already-pushed set on the client. For now just re-read
-    # the tail by counting lines: read the slice from since_byte to EOF.
     with p.open('rb') as f:
         f.seek(since_byte)
-        chunk = f.read().decode('utf-8', errors='ignore')
-    # leading line may be partial — drop it
-    lines = chunk.split('\n')[1:]
-    text = '\n'.join(lines).strip()
-    if not text:
-        return pd.DataFrame(), size
+        chunk = f.read()
+    # Trim to last complete newline so we never parse a half-written row.
+    nl = chunk.rfind(b'\n')
+    if nl < 0:
+        return pd.DataFrame(), since_byte           # no complete row yet
+    consumed_to = since_byte + nl + 1
+    text = chunk[:nl + 1].decode('utf-8', errors='ignore')
+    # If since_byte was mid-row (e.g. WS started mid-write), the first
+    # line is partial garbage — drop it. We can detect that by checking
+    # whether since_byte was preceded by a newline.
+    drop_first = False
+    if since_byte > 0:
+        with p.open('rb') as f:
+            f.seek(since_byte - 1)
+            prev = f.read(1)
+        if prev != b'\n':
+            drop_first = True
+    lines = text.splitlines()
+    if drop_first and lines:
+        lines = lines[1:]
+    if not lines:
+        return pd.DataFrame(), consumed_to
     from io import StringIO
-    cols = list(df.columns) if not df.empty else [
-        'ts_ms','inst','price','qty','side','rule','bid','ask',
-        'bid_qty','ask_qty','spread','cum_volume']
     try:
-        tail = pd.read_csv(StringIO(text), names=cols, header=None)
+        tail = pd.read_csv(StringIO('\n'.join(lines)),
+                           names=_CSV_COLS, header=None)
     except Exception:
-        return pd.DataFrame(), size
-    return tail, size
+        return pd.DataFrame(), consumed_to
+    return tail, consumed_to
 
 
 # ─── footprint aggregation (rebuilds snapshot from full CSV) ─────────────────
@@ -281,6 +308,215 @@ async def depth(inst: str = Query(...), date: Optional[str] = None):
     return JSONResponse(_latest_depth(inst, day))
 
 
+# ─── DOM profile — session-averaged resting qty per price level ──────────────
+def _build_dom_profile(inst: str, day: str, cell_size: float,
+                       lookback_min: Optional[int] = None) -> dict:
+    """Aggregate depth CSV into per-cell resting statistics.
+
+    Returns {cells: [{cell, mean_bid_qty, mean_ask_qty, max_bid_qty,
+                       max_ask_qty, bid_persistence, ask_persistence}, ...],
+             n_snapshots: int}
+    Persistence is fraction of snapshots in which that price cell appeared
+    on the given side (0..1). High persistence + high mean qty = a real wall.
+    """
+    empty = {'cells': [], 'n_snapshots': 0}
+    p = _depth_path(inst, day)
+    if not p.exists():
+        return empty
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return empty
+    if df.empty:
+        return empty
+
+    df = df.drop_duplicates(subset=['ts_ms', 'level', 'side'], keep='last')
+    if lookback_min and lookback_min > 0:
+        cutoff = int(df['ts_ms'].max() - lookback_min * 60_000)
+        df = df[df['ts_ms'] >= cutoff]
+
+    n_snaps = int(df['ts_ms'].nunique())
+    if n_snaps == 0:
+        return empty
+
+    df['price_cell'] = (df['price'] / cell_size).round() * cell_size
+
+    bid = df[df['side'] == 'BID'].groupby('price_cell').agg(
+        bid_count   =('ts_ms', 'nunique'),
+        mean_bid_qty=('qty',    'mean'),
+        max_bid_qty =('qty',    'max'),
+    )
+    ask = df[df['side'] == 'ASK'].groupby('price_cell').agg(
+        ask_count   =('ts_ms', 'nunique'),
+        mean_ask_qty=('qty',    'mean'),
+        max_ask_qty =('qty',    'max'),
+    )
+    out = pd.concat([bid, ask], axis=1).fillna(0).reset_index() \
+            .rename(columns={'price_cell': 'cell'})
+    out['bid_persistence'] = (out['bid_count'] / n_snaps).clip(0, 1)
+    out['ask_persistence'] = (out['ask_count'] / n_snaps).clip(0, 1)
+    out = out.sort_values('cell')
+
+    cells = []
+    for _, r in out.iterrows():
+        cells.append({
+            'cell':             float(r['cell']),
+            'mean_bid_qty':     float(r['mean_bid_qty']),
+            'mean_ask_qty':     float(r['mean_ask_qty']),
+            'max_bid_qty':      float(r['max_bid_qty']),
+            'max_ask_qty':      float(r['max_ask_qty']),
+            'bid_persistence':  float(r['bid_persistence']),
+            'ask_persistence':  float(r['ask_persistence']),
+        })
+    return {'cells': cells, 'n_snapshots': n_snaps}
+
+
+@app.get('/dom_profile')
+async def dom_profile(inst: str = Query(...), date: Optional[str] = None,
+                       cell: Optional[float] = None,
+                       lookback_min: Optional[int] = None):
+    if inst not in INSTRUMENTS:
+        return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
+    day = date or datetime.now().strftime('%Y-%m-%d')
+    cs  = float(cell) if cell else DEFAULT_CELL[inst]
+    return JSONResponse(_build_dom_profile(inst, day, cs, lookback_min))
+
+
+# ─── Unified positioning view ────────────────────────────────────────────────
+# Synthesises 4 independent positioning signals into one normalised view:
+#   FLOW         — recent footprint CVD (where the aggressors are)
+#   RESTING      — DOM imbalance + nearest wall direction (where the walls are)
+#   INSTITUTIONS — option_flow conviction (where the institutions are)
+#   MACRO        — news_signal direction × confidence (macro tilt)
+#
+# Each component returns {value ∈ [-1, +1], dir ∈ {-1, 0, +1}, label, ...}.
+# Composite is an equal-weighted mean (placeholder until the cross-feature
+# regression has enough data to estimate real weights).
+
+FLOW_LOOKBACK_MIN = 15      # footprint CVD window
+FLOW_THRESHOLD    = 0.10    # |normalised CVD| above this triggers a direction
+REST_THRESHOLD    = 0.10    # |top-5 imbalance| above this triggers a direction
+
+
+def _positioning_flow(inst: str, day: str) -> dict:
+    """Compute normalised footprint flow over the last FLOW_LOOKBACK_MIN."""
+    p = _tick_path(inst, day)
+    if not p.exists():
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0}
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return {'value': 0.0, 'dir': 0, 'label': 'err', 'n_ticks': 0}
+    if df.empty:
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0}
+    cutoff_ms = int(df['ts_ms'].max() - FLOW_LOOKBACK_MIN * 60_000)
+    win = df[df['ts_ms'] >= cutoff_ms]
+    if win.empty:
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0}
+    sign = win['side'].map({'BUY': 1, 'SELL': -1}).fillna(0).astype(int)
+    signed_qty = (win['qty'] * sign).sum()
+    total_qty  = win['qty'].sum()
+    val = float(signed_qty / total_qty) if total_qty > 0 else 0.0
+    direction = 1 if val > FLOW_THRESHOLD else (-1 if val < -FLOW_THRESHOLD else 0)
+    label = 'buy agg' if direction == 1 else ('sell agg' if direction == -1 else 'balanced')
+    return {'value': round(val, 3), 'dir': direction, 'label': label,
+            'n_ticks': int(len(win))}
+
+
+def _positioning_resting(inst: str, day: str) -> dict:
+    """Combine live top-5 imbalance with nearest-wall direction."""
+    d = _latest_depth(inst, day)
+    bid_sum = sum(b['qty'] for b in d.get('bids', []))
+    ask_sum = sum(a['qty'] for a in d.get('asks', []))
+    total = bid_sum + ask_sum
+    if total == 0:
+        return {'value': 0.0, 'dir': 0, 'label': 'no data',
+                'wall_dist': None, 'bid_qty': 0, 'ask_qty': 0}
+    imb = (bid_sum - ask_sum) / total
+    direction = 1 if imb > REST_THRESHOLD else (-1 if imb < -REST_THRESHOLD else 0)
+    label = 'bid heavy' if direction == 1 else \
+            ('ask heavy' if direction == -1 else 'balanced')
+    # Nearest top-5 wall (largest single resting size)
+    best_bid_q = max((b['qty'] for b in d.get('bids', [])), default=0)
+    best_ask_q = max((a['qty'] for a in d.get('asks', [])), default=0)
+    return {'value': round(imb, 3), 'dir': direction, 'label': label,
+            'bid_qty': float(bid_sum), 'ask_qty': float(ask_sum),
+            'best_bid_qty': float(best_bid_q),
+            'best_ask_qty': float(best_ask_q)}
+
+
+def _positioning_institutions(inst: str) -> dict:
+    """Read option_flow conviction from v3/cache/option_flow_<INST>.json."""
+    p = CACHE_DIR / f'option_flow_{inst}.json'
+    if not p.exists():
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'conv': 0.0}
+    try:
+        d = json.loads(p.read_text())
+    except Exception:
+        return {'value': 0.0, 'dir': 0, 'label': 'err', 'conv': 0.0}
+    conv = float(d.get('conviction', 0.0))
+    band = int(d.get('conv_band', 0))
+    direction = int(d.get('direction', 0)) or band
+    # Normalise conviction to [-1, +1]: typical scale is ±3
+    val = max(-1.0, min(1.0, conv / 3.0))
+    label = ('bull' if direction == 1 else ('bear' if direction == -1 else 'flat'))
+    return {'value': round(val, 3), 'dir': direction, 'label': label,
+            'conv': round(conv, 3), 'conv_band': band,
+            'top_strike': (d.get('top_strikes') or [{}])[0].get('strike'),
+            'top_state':  (d.get('top_strikes') or [{}])[0].get('state')}
+
+
+def _positioning_macro() -> dict:
+    """Read news_signal.json — score × confidence as magnitude."""
+    p = CACHE_DIR / 'news_signal.json'
+    if not p.exists():
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'score': 0.0}
+    try:
+        d = json.loads(p.read_text())
+    except Exception:
+        return {'value': 0.0, 'dir': 0, 'label': 'err', 'score': 0.0}
+    score = float(d.get('score', 0.0))
+    conf  = float(d.get('confidence', 0.0))
+    val   = max(-1.0, min(1.0, score * conf))
+    direction = 1 if val > 0.1 else (-1 if val < -0.1 else 0)
+    label = 'bull' if direction == 1 else \
+            ('bear' if direction == -1 else 'neutral')
+    return {'value': round(val, 3), 'dir': direction, 'label': label,
+            'score': round(score, 3), 'confidence': round(conf, 3),
+            'n_clusters': int(d.get('n_clusters', 0))}
+
+
+@app.get('/positioning')
+async def positioning(inst: str = Query(...), date: Optional[str] = None):
+    """Return the unified positioning snapshot for one instrument."""
+    if inst not in INSTRUMENTS:
+        return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
+    day = date or datetime.now().strftime('%Y-%m-%d')
+
+    flow  = _positioning_flow(inst, day)
+    rest  = _positioning_resting(inst, day)
+    inst_ = _positioning_institutions(inst)
+    macro = _positioning_macro()
+
+    # Equal-weighted composite (placeholder — swap to regression weights when
+    # research/footprint_correlation outputs them).
+    vals  = [flow['value'], rest['value'], inst_['value'], macro['value']]
+    comp  = sum(vals) / len(vals)
+    comp_dir = 1 if comp > 0.10 else (-1 if comp < -0.10 else 0)
+    comp_label = ('bullish' if comp_dir == 1 else
+                  ('bearish' if comp_dir == -1 else 'mixed'))
+
+    return JSONResponse({
+        'inst': inst, 'date': day,
+        'flow': flow, 'resting': rest,
+        'institutions': inst_, 'macro': macro,
+        'composite': {'value': round(comp, 3), 'dir': comp_dir,
+                      'label': comp_label,
+                      'aligned': (flow['dir'] == rest['dir'] == inst_['dir'] == macro['dir']
+                                  and flow['dir'] != 0)},
+    })
+
+
 # ─── WebSocket tail-streamer ─────────────────────────────────────────────────
 @app.websocket('/ws')
 async def ws_endpoint(ws: WebSocket, inst: str = Query(...),
@@ -294,10 +530,11 @@ async def ws_endpoint(ws: WebSocket, inst: str = Query(...),
     day = date_ or datetime.now().strftime('%Y-%m-%d')
     log.info("WS open inst=%s day=%s poll=%dms", inst, day, poll_ms)
 
-    last_byte = 0
+    # -1 = uninitialised sentinel. _read_ticks resolves this to current EOF
+    # on its first call without replaying file history (which would cause
+    # client-side double-counting against the snapshot).
     p = _tick_path(inst, day)
-    if p.exists():
-        last_byte = p.stat().st_size  # start from EOF — only stream NEW
+    last_byte = p.stat().st_size if p.exists() else -1
 
     last_depth_ts = 0
     try:
@@ -306,8 +543,12 @@ async def ws_endpoint(ws: WebSocket, inst: str = Query(...),
 
             # 1) tick tail
             tail, new_byte = _read_ticks(inst, day, last_byte)
+            # Always advance the cursor — even on empty reads — so the
+            # uninitialised-sentinel case (-1 → current EOF) resolves on the
+            # first poll. Otherwise we'd remain at -1 forever and miss every
+            # subsequent tick.
+            last_byte = new_byte
             if not tail.empty:
-                last_byte = new_byte
                 rows = []
                 for _, r in tail.iterrows():
                     rows.append({

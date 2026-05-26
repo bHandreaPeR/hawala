@@ -37,8 +37,9 @@ Microsoft Store python.exe filename alias conflict).
 ## 🟡 Open — high priority
 
 ### Wait for data (3 weeks)
-- **Footprint correlation analysis** — once `trade_logs/footprint_features.csv` has 30+ rows with `fp_data_available=True`, regress `win ~ fp_*`. If signal emerges, build the veto layer.
-  - Status: 26 trades extracted today, only 2 with tick context. ~10-15 trades/week expected.
+- **Footprint + DOM correlation analysis** — once `trade_logs/footprint_features.csv` has 30+ rows with both `fp_data_available=True` and `dom_data_available=True`, regress `win ~ fp_* + dom_*`. If signal emerges, build the veto / conviction layer.
+  - Status: 26 trades extracted today, only 2 with full tick + depth context. ~10-15 trades/week expected.
+  - Joined CSV now has 20 footprint columns + 23 DOM columns (top-5 walls, imbalance trend, persistence, iceberg refresh count). `research/dom_features.py` is the new feature extractor; `research/footprint_correlation.py` joins both per trade.
   - Trigger: rerun `python research/footprint_correlation.py` weekly.
 
 ### Telegram bot enhancements
