@@ -164,11 +164,15 @@ def main() -> None:
 
     log.info('boot — instruments=%s poll=%.0fs end=%d', INSTRUMENTS, POLL_SEC, END_HHMM)
 
-    if not _market_open_now():
-        log.info('market not open (now=%s) — sleeping until 09:15',
-                 datetime.now().strftime('%H:%M'))
-        # Don't busy-wait; the cron will fire us again. Exit cleanly.
-        return
+    # If cron fired us slightly before 09:15 (e.g. 09:11), wait — don't exit.
+    # Otherwise we'd miss the morning entirely until the next cron tick.
+    while not _market_open_now():
+        now = datetime.now()
+        if now.weekday() >= 5 or now.time() >= dtime(*divmod(END_HHMM, 100)):
+            log.info('market closed for the day (now=%s) — exiting', now.strftime('%H:%M'))
+            return
+        log.info('pre-market (now=%s) — sleeping 30s', now.strftime('%H:%M'))
+        time.sleep(30)
 
     g = _get_groww()
     log.info('Groww auth OK')

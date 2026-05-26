@@ -116,10 +116,16 @@ def main() -> None:
 
     log.info('boot — poll=%.0fs end=%d', POLL_SEC, END_HHMM)
 
-    if not _market_open_now():
-        log.info('market not open (now=%s) — exiting (cron will retrigger)',
-                 datetime.now().strftime('%H:%M'))
-        return
+    # If cron fired us slightly before 09:15 (e.g. 09:12), wait — don't exit.
+    while not _market_open_now():
+        now = datetime.now()
+        eh, em = END_HHMM // 100, END_HHMM % 100
+        if now.weekday() >= 5 or now.time() >= dtime(eh, em):
+            log.info('market closed for the day (now=%s) — exiting',
+                     now.strftime('%H:%M'))
+            return
+        log.info('pre-market (now=%s) — sleeping 30s', now.strftime('%H:%M'))
+        time.sleep(30)
 
     token, chat_ids = _load_creds()
     if not token or not chat_ids:

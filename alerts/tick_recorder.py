@@ -378,6 +378,20 @@ def main() -> None:
     last_hb = time.time()
     n_ticks_total = 0
 
+    # If cron fired us slightly pre-market (e.g. 09:12), wait — don't exit.
+    while _running and not _market_open_now():
+        now = datetime.now()
+        eh, em = END_HHMM // 100, END_HHMM % 100
+        if now.weekday() >= 5 or now.time() >= dtime(eh, em):
+            log.info('market closed for the day (now=%s) — exiting',
+                     now.strftime('%H:%M'))
+            for w in writers.values(): w.close()
+            for w in depth_writers.values(): w.close()
+            poll_stop.set()
+            return
+        log.info('pre-market (now=%s) — sleeping 30s', now.strftime('%H:%M'))
+        time.sleep(30)
+
     try:
         while _running and _market_open_now():
             t_loop = time.time()
