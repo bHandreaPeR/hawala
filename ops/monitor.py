@@ -74,7 +74,13 @@ CHECK_INTERVAL_S       = 30
 GRACE_AFTER_RESTART_S  = 45     # let the new process warm up before re-checking
 MAX_RESTARTS_PER_HOUR  = 3      # beyond this, escalate + stop restarting
 MARKET_OPEN  = dtime(9, 10)
-MARKET_CLOSE = dtime(15, 40)
+# IMPORTANT: must be EARLIER than every monitored daemon's END_HHMM
+# (currently 15:35 for tick_recorder, spot_vix_recorder, vp_paper_executor,
+# index_1m_intraday — they self-exit at that point by design). Otherwise the
+# 15:35-15:40 window sees "process dead during market hours" → restart →
+# daemon immediately re-exits → escalation → false-positive Telegram alert.
+# 15:33 gives a 2-min buffer before any daemon's clean shutdown.
+MARKET_CLOSE = dtime(15, 33)
 
 
 # ─── Logging (flushing — heartbeats reach disk immediately) ──────────────────
