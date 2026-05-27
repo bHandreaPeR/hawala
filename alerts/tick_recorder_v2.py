@@ -137,17 +137,19 @@ def _get_groww():
     raise RuntimeError(f'Groww auth failed after 3 attempts: {last_err}')
 
 
-def _last_tuesday(y: int, m: int) -> date:
+def _last_weekday(y: int, m: int, weekday: int) -> date:
+    """weekday: 0=Mon 1=Tue 2=Wed ... 6=Sun. Returns the last such weekday in (y,m)."""
     last_day = (date(y + 1, 1, 1) - timedelta(days=1)) if m == 12 \
         else (date(y, m + 1, 1) - timedelta(days=1))
-    return last_day - timedelta(days=(last_day.weekday() - 1) % 7)
+    return last_day - timedelta(days=(last_day.weekday() - weekday) % 7)
 
 
-def _near_monthly_expiry(today: date) -> date:
+def _near_monthly_expiry(today: date, weekday: int) -> date:
     OVERRIDES = {date(2026, 3, 31): date(2026, 3, 30)}
     y, m = today.year, today.month
     for _ in range(3):
-        exp = OVERRIDES.get(_last_tuesday(y, m), _last_tuesday(y, m))
+        exp = OVERRIDES.get(_last_weekday(y, m, weekday),
+                            _last_weekday(y, m, weekday))
         if exp >= today:
             return exp
         m, y = (1, y + 1) if m == 12 else (m + 1, y)
@@ -155,10 +157,19 @@ def _near_monthly_expiry(today: date) -> date:
 
 
 def _resolve_symbol(g, inst: str, today: date) -> dict:
-    # SENSEX trades on BSE, NIFTY/BANKNIFTY on NSE
-    exch = 'BSE' if inst == 'SENSEX' else 'NSE'
-    exp  = _near_monthly_expiry(today)
-    sym  = f'{exch}-{inst}-{exp.day}{exp.strftime("%b")}{exp.strftime("%y")}-FUT'
+    """Resolve current monthly fut for inst. NIFTY/BANKNIFTY expire last Tue
+    on NSE; SENSEX expires last Wed on BSE. If today *is* the expiry day,
+    roll forward to next month (the expiring contract often has low post-
+    morning volume and the next month is where positioning has moved)."""
+    if inst == 'SENSEX':
+        exch, weekday = 'BSE', 2     # last Wed
+    else:
+        exch, weekday = 'NSE', 1     # last Tue
+    exp = _near_monthly_expiry(today, weekday)
+    if exp == today:                  # roll to next month on expiry day itself
+        nxt = today + timedelta(days=8)
+        exp = _near_monthly_expiry(nxt, weekday)
+    sym = f'{exch}-{inst}-{exp.day}{exp.strftime("%b")}{exp.strftime("%y")}-FUT'
     try:
         meta = g.get_instrument_by_groww_symbol(sym)
     except Exception as e:
@@ -297,8 +308,9 @@ class _VolPoller(threading.Thread):
         while not self._stop.is_set():
             t0 = time.time()
             for inst, c in self._contracts.items():
+                seg = 'BFO' if inst == 'SENSEX' else 'FNO'
                 try:
-                    r = self._g.get_quote(exchange=c['exchange'], segment='FNO',
+                    r = self._g.get_quote(exchange=c['exchange'], segment=seg,
                                           trading_symbol=c['trading_symbol'])
                     self._state[inst] = {
                         'cum_volume': float(r.get('volume') or 0.0),
@@ -402,8 +414,9 @@ def main() -> None:
     stop_evt = threading.Event()
     vp = _VolPoller(g, contracts, vol_state, stop_evt); vp.start()
 
-    # Connect WS feed
-    feed = g.get_feed()
+    # Connect WS feed — GrowwFeed wraps the NATS subscription stack
+    from growwapi import GrowwFeed
+    feed = GrowwFeed(g)
 
     # Map token → inst for fast callback dispatch
     tok2inst = {c['exchange_token']: i for i, c in contracts.items()}
