@@ -43,6 +43,7 @@ import json
 import logging
 import pickle
 import signal
+import socket
 import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta
@@ -50,6 +51,7 @@ from pathlib import Path
 
 import csv
 
+import pandas as pd
 import pyotp
 import pandas as pd
 
@@ -57,13 +59,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # ─── Config (env-overridable) ────────────────────────────────────────────────
-INSTRUMENTS_ENV = os.environ.get('TICK_REC_INSTRUMENTS', 'NIFTY,BANKNIFTY')
+INSTRUMENTS_ENV = os.environ.get('TICK_REC_INSTRUMENTS', 'NIFTY,BANKNIFTY,SENSEX')
 POLL_MS         = int(os.environ.get('TICK_REC_POLL_MS', '100'))
 FLUSH_N         = int(os.environ.get('TICK_REC_FLUSH_N',   '20'))
 FLUSH_SEC       = float(os.environ.get('TICK_REC_FLUSH_SEC', '1'))
 HEARTBEAT_SEC   = float(os.environ.get('TICK_REC_HEARTBEAT_SEC', '60'))
 END_HHMM        = int(os.environ.get('TICK_REC_END_HHMM', '1535'))
 DEPTH_SEC       = float(os.environ.get('TICK_REC_DEPTH_SEC', '1.0'))
+
+# Network-resilience watchdog (added after 2026-05-27 DNS outage wedged
+# the recorder for 30+ minutes each time).
+WATCHDOG_SEC    = float(os.environ.get('TICK_REC_WATCHDOG_SEC',  '60'))
+DNS_CHECK_SEC   = float(os.environ.get('TICK_REC_DNS_CHECK_SEC', '300'))
+RECONNECT_RETRY_SLEEP = float(os.environ.get('TICK_REC_RECONNECT_SLEEP', '5'))
+RECONNECT_ALERT_AFTER = int  (os.environ.get('TICK_REC_RECONNECT_ALERT_AFTER', '3'))
+GROWW_HOST      = os.environ.get('TICK_REC_GROWW_HOST', 'api.groww.in')
 
 CACHE_DIR = ROOT / 'v3' / 'cache'
 LOG_DIR   = ROOT / 'logs' / 'trade_bot'
@@ -95,17 +105,26 @@ log = _setup_logging()
 
 
 # ─── Auth (same retry pattern as option_flow_daemon) ─────────────────────────
+def _load_env() -> dict:
+    env: dict = {}
+    try:
+        with open(ROOT / 'token.env') as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, _, v = line.partition('=')
+                    env[k.strip()] = v.strip()
+    except Exception as e:
+        log.warning("token.env unreadable: %s", e)
+    return env
+
+
 def _get_groww():
     from growwapi import GrowwAPI
     last_err = None
     for attempt in range(3):
         try:
-            env = {}
-            with open(ROOT / 'token.env') as f:
-                for line in f:
-                    if '=' in line:
-                        k, _, v = line.strip().partition('=')
-                        env[k] = v
+            env = _load_env()
             totp = pyotp.TOTP(env['GROWW_TOTP_SECRET']).now()
             token = GrowwAPI.get_access_token(api_key=env['GROWW_API_KEY'], totp=totp)
             return GrowwAPI(token=token)
@@ -115,6 +134,107 @@ def _get_groww():
                         attempt + 1, e)
             time.sleep(5)
     raise RuntimeError(f"Groww auth failed after 3 attempts: {last_err}")
+
+
+# ─── Network-resilience helpers ──────────────────────────────────────────────
+def _dns_ok(host: str = GROWW_HOST) -> bool:
+    """Resolve `host` via the OS resolver. Returns False on any failure
+    (NXDOMAIN, timeout, no network). Doesn't raise."""
+    try:
+        socket.gethostbyname(host)
+        return True
+    except (socket.gaierror, OSError) as e:
+        log.warning("DNS check failed for %s: %s", host, e)
+        return False
+
+
+def _subscribe_feed(g, contracts: dict):
+    """Build a fresh GrowwFeed and subscribe LTP + market_depth.
+    Returns (feed, inst_dicts). Raises on any failure — caller decides
+    whether to retry. Caller is responsible for tearing down any prior feed."""
+    from growwapi import GrowwFeed
+    feed = GrowwFeed(g)
+    # Per-inst exchange + segment (not hardcoded NSE/FNO) so SENSEX (BSE)
+    # rides the same WS subscription as NIFTY/BANKNIFTY (NSE) — Groww routes
+    # them on different topics but exposes a unified subscribe_* API.
+    inst_dicts = [{'exchange': c['exchange'],
+                   'segment':  c['segment'],
+                   'exchange_token': c['exchange_token']}
+                  for c in contracts.values()]
+    feed.subscribe_ltp(inst_dicts)
+    feed.subscribe_market_depth(inst_dicts)
+    return feed, inst_dicts
+
+
+def _send_macro_alert(text: str) -> None:
+    """Send a Telegram alert to the MACRO channel. Best-effort — any send
+    failure is logged and swallowed (we don't want telemetry to wedge the
+    recorder)."""
+    try:
+        from alerts import telegram
+        env = _load_env()
+        token = (env.get('TELEGRAM_BOT_TOKEN_MACRO')
+                 or env.get('TELEGRAM_BOT_TOKEN') or '').strip()
+        chats_raw = (env.get('TELEGRAM_CHAT_IDS_MACRO')
+                     or env.get('TELEGRAM_CHAT_IDS') or '').strip()
+        chats = [c.strip() for c in chats_raw.split(',') if c.strip()]
+        if not token or not chats:
+            log.warning('MACRO telegram creds missing; alert dropped: %s',
+                        text[:120])
+            return
+        for chat in chats:
+            telegram.send(token, chat, text)
+    except Exception as e:
+        log.warning('MACRO telegram send failed: %s', e)
+
+
+def _attempt_reconnect(state: dict, tick_states: dict) -> bool:
+    """Tear down the old feed (best-effort), re-auth, build a fresh
+    GrowwFeed, resubscribe. Mutates `state` in place. Returns True on
+    success.
+
+    Also reseeds per-instrument TickState so the first tick after
+    reconnect re-anchors prev_ts_ms / prev_cum_vol cleanly instead of
+    writing a misleading GAP marker for the outage window."""
+    log.warning("WS reconnect: tearing down old feed and re-authing")
+
+    old_feed = state.get('feed')
+    old_inst_dicts = state.get('inst_dicts') or []
+    if old_feed is not None:
+        for fn_name in ('unsubscribe_ltp', 'unsubscribe_market_depth'):
+            try:
+                getattr(old_feed, fn_name)(old_inst_dicts)
+            except Exception as e:
+                # Expected — the underlying socket is usually dead by now.
+                log.info("old feed %s err (expected): %s", fn_name, e)
+
+    try:
+        new_g = _get_groww()
+    except Exception as e:
+        log.error("reconnect re-auth failed: %s", e)
+        return False
+
+    try:
+        new_feed, inst_dicts = _subscribe_feed(new_g, state['contracts'])
+    except Exception as e:
+        log.error("reconnect resubscribe failed: %s", e)
+        return False
+
+    state['g']          = new_g
+    state['feed']       = new_feed
+    state['inst_dicts'] = inst_dicts
+
+    # Reseed tick states so the post-outage first tick doesn't emit a
+    # GAP row spanning the outage (the gap is real but already logged).
+    for st in tick_states.values():
+        st.seen_first = False
+
+    poller = state.get('poller')
+    if poller is not None:
+        poller.replace_client(new_g)
+
+    log.info("WS reconnect OK — %d tokens resubscribed", len(inst_dicts))
+    return True
 
 
 # ─── Contract resolver — current monthly fut for NIFTY / BANKNIFTY ───────────
@@ -136,13 +256,40 @@ def _near_monthly_expiry(today: date) -> date:
 
 
 def _resolve_symbol(g, inst: str, today: date) -> dict:
-    exp = _near_monthly_expiry(today)
-    sym = f"NSE-{inst}-{exp.day}{exp.strftime('%b')}{exp.strftime('%y')}-FUT"
-    meta = g.get_instrument_by_groww_symbol(sym)
-    return {'inst': inst, 'symbol': sym,
-            'exchange_token': str(meta['exchange_token']),
-            'trading_symbol': str(meta['trading_symbol']),
-            'lot_size': int(meta['lot_size']), 'tick_size': float(meta['tick_size'])}
+    """Find the near-month FUT for `inst` by enumerating Groww's full
+    instrument universe and picking the FUT with the smallest expiry_date
+    strictly AFTER today (i.e., skip an expiring-today contract since its
+    post-EOD liquidity is gone and we want tomorrow's trading anyway).
+
+    Multi-exchange aware: SENSEX trades on BSE, NIFTY/BANKNIFTY on NSE,
+    all share `segment='FNO'`. Caller MUST pass the returned `exchange`
+    and `segment` into feed.subscribe_* and g.get_quote, not hardcoded.
+
+    Earlier hand-coded version assumed last-Tuesday expiry + NSE-prefixed
+    groww_symbol, which broke for SENSEX (last-Wed-ish, BSE-prefixed) and
+    for NIFTY/BANKNIFTY whenever a holiday shifted the expiry day.
+    """
+    df = g.get_all_instruments()
+    sub = df[(df.instrument_type == 'FUT') &
+             (df.underlying_symbol == inst)].copy()
+    if sub.empty:
+        raise RuntimeError(f'no FUT contracts found for {inst} in Groww universe')
+    sub['expiry_dt'] = pd.to_datetime(sub['expiry_date']).dt.date
+    valid = sub[sub.expiry_dt > today]
+    if valid.empty:
+        raise RuntimeError(f'no FUT contracts with expiry > {today} for {inst}')
+    pick = valid.sort_values('expiry_dt').iloc[0]
+    return {
+        'inst':           inst,
+        'symbol':         str(pick['groww_symbol']),
+        'exchange':       str(pick['exchange']),       # NSE / BSE
+        'segment':        str(pick['segment']),        # FNO (current convention)
+        'exchange_token': str(pick['exchange_token']),
+        'trading_symbol': str(pick['trading_symbol']),
+        'lot_size':       int(pick['lot_size']),
+        'tick_size':      float(pick['tick_size']),
+        'expiry_date':    str(pick['expiry_dt']),
+    }
 
 
 # ─── REST cum-volume poller (background thread) ──────────────────────────────
@@ -156,18 +303,37 @@ VOL_STALE_MS     = int  (os.environ.get('TICK_REC_VOL_STALE_MS','3000'))
 
 
 class _VolPoller(threading.Thread):
+    # After REAUTH_AFTER consecutive cycles with at least one inst error,
+    # rebuild the GrowwAPI client. Backoff is exponential, capped at CAP.
+    REAUTH_AFTER = 3
+    BACKOFF_BASE = 2.0
+    BACKOFF_CAP  = 60.0
+
     def __init__(self, g, contracts: dict, state: dict, stop_evt: threading.Event):
         super().__init__(daemon=True, name='vol-poller')
         self._g, self._contracts = g, contracts
         self._state, self._stop = state, stop_evt
+        self._consec_fail = 0
+        self._lock = threading.Lock()
+
+    def replace_client(self, g) -> None:
+        """Swap in a freshly re-authed GrowwAPI client (called by the WS
+        reconnect path). Thread-safe."""
+        with self._lock:
+            self._g = g
+            self._consec_fail = 0
 
     def run(self):
         while not self._stop.is_set():
             t0 = time.time()
+            had_err = False
+            with self._lock:
+                g = self._g
             for inst, c in self._contracts.items():
                 try:
-                    r = self._g.get_quote(exchange='NSE', segment='FNO',
-                                          trading_symbol=c['trading_symbol'])
+                    r = g.get_quote(exchange=c['exchange'],
+                                    segment=c['segment'],
+                                    trading_symbol=c['trading_symbol'])
                     self._state[inst] = {
                         'cum_volume': float(r.get('volume')   or 0.0),
                         'last_qty':   float(r.get('last_trade_quantity') or 0.0),
@@ -179,7 +345,29 @@ class _VolPoller(threading.Thread):
                         'updated_at_ms': int(time.time() * 1000),
                     }
                 except Exception as e:
+                    had_err = True
                     log.warning("vol_poll %s err: %s", inst, e)
+
+            if had_err:
+                self._consec_fail += 1
+                if self._consec_fail >= self.REAUTH_AFTER:
+                    log.warning("vol_poll %d consec failures — re-authing GrowwAPI",
+                                self._consec_fail)
+                    try:
+                        new_g = _get_groww()
+                        with self._lock:
+                            self._g = new_g
+                        self._consec_fail = 0
+                        log.info("vol_poll re-auth OK")
+                    except Exception as e:
+                        log.warning("vol_poll re-auth failed: %s — backing off", e)
+                # Exponential backoff (2,4,8,16,32,60 capped).
+                sleep_s = min(self.BACKOFF_CAP,
+                              self.BACKOFF_BASE * (2 ** min(self._consec_fail - 1, 5)))
+                self._stop.wait(sleep_s)
+                continue
+
+            self._consec_fail = 0
             dt = time.time() - t0
             if dt < VOL_POLL_SEC:
                 self._stop.wait(VOL_POLL_SEC - dt)
@@ -381,6 +569,11 @@ def main() -> None:
     log.info("tick_recorder boot — instruments=%s poll=%dms flush_n=%d flush_sec=%.0f end=%d",
              insts, POLL_MS, FLUSH_N, FLUSH_SEC, END_HHMM)
 
+    # Startup DNS sanity-check — if we can't resolve api.groww.in here,
+    # auth will fail anyway. Log but don't abort; _get_groww has its own
+    # retry loop and the recorder may be started during a transient blip.
+    _dns_ok()
+
     g = _get_groww()
     today = date.today()
     contracts = {i: _resolve_symbol(g, i, today) for i in insts}
@@ -388,14 +581,9 @@ def main() -> None:
         log.info("  contract %s → %s token=%s lot=%d tick=%.2f",
                  i, c['symbol'], c['exchange_token'], c['lot_size'], c['tick_size'])
 
-    # Subscribe (one socket, both feeds)
-    from growwapi import GrowwFeed
-    feed = GrowwFeed(g)
-    inst_dicts = [{'exchange': 'NSE', 'segment': 'FNO',
-                   'exchange_token': c['exchange_token']}
-                  for c in contracts.values()]
-    feed.subscribe_ltp(inst_dicts)
-    feed.subscribe_market_depth(inst_dicts)
+    # Subscribe (one socket, both feeds). All mutable connection state lives
+    # in `conn` so the reconnect path can swap things atomically.
+    feed, inst_dicts = _subscribe_feed(g, contracts)
     log.info("WS subscribed: LTP + market_depth on %d tokens", len(inst_dicts))
 
     states  = {i: TickState() for i in insts}
@@ -411,6 +599,14 @@ def main() -> None:
     poll_dt = POLL_MS / 1000.0
     last_hb = time.time()
     n_ticks_total = 0
+
+    conn = {
+        'g': g, 'feed': feed, 'inst_dicts': inst_dicts,
+        'contracts': contracts, 'poller': poller,
+    }
+    last_ws_fresh_wall = time.time()   # wall-clock of last NEW ts_ms observed
+    last_dns_check     = time.time()
+    reconnect_attempts = 0             # only resets when fresh ticks return
 
     # If cron fired us slightly pre-market (e.g. 09:12), wait — don't exit.
     while _running and not _market_open_now():
@@ -429,6 +625,45 @@ def main() -> None:
     try:
         while _running and _market_open_now():
             t_loop = time.time()
+            now_wall = t_loop
+
+            # ── DNS health check (every DNS_CHECK_SEC) ───────────────────
+            need_reconnect = False
+            reconnect_reason = ''
+            if now_wall - last_dns_check >= DNS_CHECK_SEC:
+                last_dns_check = now_wall
+                if not _dns_ok():
+                    need_reconnect = True
+                    reconnect_reason = 'dns'
+
+            # ── Watchdog: no fresh LTP in WATCHDOG_SEC ───────────────────
+            stall_s = now_wall - last_ws_fresh_wall
+            if stall_s > WATCHDOG_SEC:
+                need_reconnect = True
+                reconnect_reason = reconnect_reason or 'stall'
+                log.warning("watchdog: no fresh LTP for %.1fs > %.0fs",
+                            stall_s, WATCHDOG_SEC)
+
+            if need_reconnect:
+                ok = _attempt_reconnect(conn, states)
+                reconnect_attempts += 1
+                if ok:
+                    # Grant a fresh WATCHDOG_SEC grace window for ticks to arrive
+                    last_ws_fresh_wall = time.time()
+                else:
+                    time.sleep(RECONNECT_RETRY_SLEEP)
+                if reconnect_attempts >= RECONNECT_ALERT_AFTER:
+                    msg = (f"🚨 <b>tick_recorder wedged</b> — "
+                           f"{reconnect_attempts} reconnect attempts "
+                           f"(reason: {reconnect_reason}, last_fresh={stall_s:.0f}s ago, "
+                           f"insts={','.join(insts)}) "
+                           f"@ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    log.error(msg.replace('<b>','').replace('</b>',''))
+                    _send_macro_alert(msg)
+                    reconnect_attempts = 0   # avoid spam; next 3 failures realert
+                continue
+
+            feed = conn['feed']
             try:
                 ltp_all   = feed.get_ltp() or {}
                 depth_all = feed.get_market_depth() or {}
@@ -439,8 +674,10 @@ def main() -> None:
 
             for inst, c in contracts.items():
                 tok = c['exchange_token']
-                ltp_row = (ltp_all.get('NSE', {}).get('FNO', {}) or {}).get(tok)
-                dep_row = (depth_all.get('NSE', {}).get('FNO', {}) or {}).get(tok)
+                # Per-inst routing (SENSEX = BSE/FNO, NIFTY/BANKNIFTY = NSE/FNO)
+                exch_key, seg_key = c['exchange'], c['segment']
+                ltp_row = (ltp_all.get(exch_key, {}).get(seg_key, {}) or {}).get(tok)
+                dep_row = (depth_all.get(exch_key, {}).get(seg_key, {}) or {}).get(tok)
 
                 # Persist a depth snapshot at most every DEPTH_SEC
                 now_t = time.time()
@@ -478,6 +715,11 @@ def main() -> None:
                 # the REST poller; using it here would race the poll interval.)
                 if ts_ms == st.prev_ts_ms:
                     continue
+
+                # Fresh ts → feed is alive. Reset watchdog + reconnect counter.
+                last_ws_fresh_wall = time.time()
+                if reconnect_attempts:
+                    reconnect_attempts = 0
 
                 bid, ask, bq, aq = _best_quote(dep_row)
 
@@ -588,10 +830,14 @@ def main() -> None:
             w.close()
         for dw in depth_writers.values():
             dw.close()
-        # Try to unsubscribe cleanly (best-effort)
+        # Try to unsubscribe cleanly (best-effort) — read from `conn` since
+        # the reconnect path may have rebuilt feed / inst_dicts mid-session.
         try:
-            feed.unsubscribe_ltp(inst_dicts)
-            feed.unsubscribe_market_depth(inst_dicts)
+            cur_feed = conn.get('feed')
+            cur_ids  = conn.get('inst_dicts') or []
+            if cur_feed is not None:
+                cur_feed.unsubscribe_ltp(cur_ids)
+                cur_feed.unsubscribe_market_depth(cur_ids)
         except Exception:
             pass
         poller.join(timeout=3)

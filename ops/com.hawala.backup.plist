@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hawala nightly GDrive backup.
+
+  Fires at 22:30 IST Mon–Fri (after EOD writes complete, before midnight).
+
+  Install:
+      cp ops/com.hawala.backup.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.hawala.backup.plist
+
+  Verify (manual trigger):
+      launchctl start com.hawala.backup
+      tail -f logs/macro_bot/backup-$(date +%Y-%m-%d).log
+
+  Pause:
+      launchctl unload ~/Library/LaunchAgents/com.hawala.backup.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hawala.backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/ops/backup_to_gdrive.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2</string>
+
+    <!-- Weekdays at 22:30 IST. StartCalendarInterval array fires once per match. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/macro_bot/backup_launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/macro_bot/backup_launchd.err</string>
+</dict>
+</plist>
