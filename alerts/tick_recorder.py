@@ -150,7 +150,9 @@ def _resolve_symbol(g, inst: str, today: date) -> dict:
 # decode the LIVE_DATA_DETAILED topic). We poll REST get_quote() every
 # VOL_POLL_SEC and stash cum-volume + last-trade-qty so the main tick loop can
 # attach a real qty to each classified print.
-VOL_POLL_SEC = float(os.environ.get('TICK_REC_VOL_POLL_SEC', '2.0'))
+VOL_POLL_SEC     = float(os.environ.get('TICK_REC_VOL_POLL_SEC', '2.0'))
+GAP_THRESHOLD_MS = int  (os.environ.get('TICK_REC_GAP_MS',      '5000'))
+VOL_STALE_MS     = int  (os.environ.get('TICK_REC_VOL_STALE_MS','3000'))
 
 
 class _VolPoller(threading.Thread):
@@ -173,7 +175,8 @@ class _VolPoller(threading.Thread):
                         'oi':         float(r.get('open_interest') or 0.0),
                         'total_buy_qty':  float(r.get('total_buy_quantity')  or 0.0),
                         'total_sell_qty': float(r.get('total_sell_quantity') or 0.0),
-                        'updated_at': time.time(),
+                        'updated_at':    time.time(),
+                        'updated_at_ms': int(time.time() * 1000),
                     }
                 except Exception as e:
                     log.warning("vol_poll %s err: %s", inst, e)
@@ -193,8 +196,35 @@ class TickState:
     n_buy:           int     = 0
     n_sell:          int     = 0
     n_unk:           int     = 0
+    n_qty_zero:      int     = 0
+    n_reversal:      int     = 0
+    n_gap:           int     = 0
+    msg_seq:         int     = 0
     cum_delta_qty:   float   = 0.0
     last_quote_rule_pct: float = 0.0
+
+
+# ─── Derived feature helpers (microprice + Lee-Ready aggression score) ──────
+def _microprice(bid: float, ask: float, bq: float, aq: float) -> float:
+    """Size-weighted mid: (ask*bid_qty + bid*ask_qty) / (bid_qty + ask_qty).
+    Better than (bid+ask)/2 because it leans toward the thinner side, which
+    is where price is most likely to move next."""
+    denom = bq + aq
+    if denom <= 0 or bid <= 0 or ask <= 0:
+        return (bid + ask) / 2 if (bid > 0 and ask > 0) else 0.0
+    return (ask * bq + bid * aq) / denom
+
+
+def _aggression(price: float, bid: float, ask: float) -> float:
+    """Continuous Lee-Ready: where on the spread did this trade hit?
+    +1 = full lift (price = ask), -1 = full hit (price = bid), 0 = at mid."""
+    if bid <= 0 or ask <= bid:
+        return 0.0
+    mid = (bid + ask) / 2.0
+    half = (ask - bid) / 2.0
+    if half <= 0:
+        return 0.0
+    return max(-1.0, min(1.0, (price - mid) / half))
 
 
 def classify(price: float, prev_price: float, prev_side: str,
@@ -266,9 +296,13 @@ class DepthWriter:
 class TickWriter:
     """Buffered CSV writer. Flushes when len(buffer) ≥ FLUSH_N or elapsed
     ≥ FLUSH_SEC. One file per instrument per day."""
+    # v1.1: added microprice / notional / aggression / gap_ms / msg_seq.
+    # Backward-compatible — pd.read_csv on yesterday's files just doesn't see
+    # the new columns; today's research already filters by `qty > 0`.
     COLUMNS = [
         'ts_ms', 'inst', 'price', 'qty', 'side', 'rule',
         'bid', 'ask', 'bid_qty', 'ask_qty', 'spread', 'cum_volume',
+        'microprice', 'notional', 'aggression', 'gap_ms', 'msg_seq',
     ]
 
     def __init__(self, inst: str, run_date: date):
@@ -445,16 +479,77 @@ def main() -> None:
                 if ts_ms == st.prev_ts_ms:
                     continue
 
-                qty = max(cum_vol - st.prev_cum_vol, 0.0)
                 bid, ask, bq, aq = _best_quote(dep_row)
-                side, rule = classify(price, st.prev_ltp, st.prev_side,
-                                      bid, ask, c['tick_size'])
 
+                # ── Gap detection ────────────────────────────────────────
+                # If we haven't seen a tick for this inst in > GAP_THRESHOLD_MS
+                # write a synthetic marker row so research can filter/count
+                # gaps without re-deriving from raw ts_ms diffs. Common cause:
+                # WS reconnect, app sleep, Mac backgrounded.
+                gap_ms = ts_ms - st.prev_ts_ms
+                if gap_ms > GAP_THRESHOLD_MS:
+                    st.n_gap += 1
+                    writers[inst].add({
+                        'ts_ms': st.prev_ts_ms + gap_ms // 2, 'inst': inst,
+                        'price': price, 'qty': 0, 'side': 'GAP', 'rule': 'GAP',
+                        'bid': bid, 'ask': ask, 'bid_qty': bq, 'ask_qty': aq,
+                        'spread': max(ask - bid, 0.0),
+                        'cum_volume': st.prev_cum_vol,
+                        'microprice': _microprice(bid, ask, bq, aq),
+                        'notional': 0.0, 'aggression': 0.0,
+                        'gap_ms': gap_ms, 'msg_seq': st.msg_seq,
+                    })
+
+                # ── cum_volume reversal detection ────────────────────────
+                # When the broker returns a SMALLER cum_volume than we last
+                # saw (happens during reconnect / API hiccup) we used to
+                # silently clamp qty to 0 forever via max(cum_vol - prev, 0).
+                # Now: detect, log, re-seed prev to the new lower value, tag
+                # the resulting row with RESEED. The bug that wedged today's
+                # 10:20-10:28 window was exactly this — never silent again.
+                rule_extra = ''
+                if cum_vol < st.prev_cum_vol:
+                    st.n_reversal += 1
+                    rule_extra = 'RESEED'
+                    log.warning('%s cum_volume reversal: %.0f → %.0f (re-seeding)',
+                                inst, st.prev_cum_vol, cum_vol)
+                    st.prev_cum_vol = cum_vol
+                qty = max(cum_vol - st.prev_cum_vol, 0.0)
+
+                # ── qty=0 filter ─────────────────────────────────────────
+                # qty=0 means "WS pushed a new timestamp but vol-poller hasn't
+                # caught up yet". If vol-poller is FRESH (<= VOL_STALE_MS),
+                # the gap is a quote-only update — drop it (phantom row that
+                # used to inflate tick-count imbalance features in research).
+                # If vol-poller is STALE, keep the row but tag UNVERIFIED so
+                # research can decide whether to use it.
+                vol_age_ms = int(time.time() * 1000) - \
+                             int(vs.get('updated_at_ms', 0))
+                if qty <= 0:
+                    st.n_qty_zero += 1
+                    if vol_age_ms <= VOL_STALE_MS:
+                        # Pure quote update — advance state, no row written
+                        st.prev_ts_ms = ts_ms
+                        st.prev_ltp   = price
+                        continue
+                    rule_extra = (rule_extra + '|UNVERIFIED').lstrip('|') \
+                                  if rule_extra else 'UNVERIFIED'
+
+                side, base_rule = classify(price, st.prev_ltp, st.prev_side,
+                                           bid, ask, c['tick_size'])
+                rule = f'{base_rule}|{rule_extra}' if rule_extra else base_rule
+
+                st.msg_seq += 1
                 writers[inst].add({
                     'ts_ms': ts_ms, 'inst': inst, 'price': price, 'qty': qty,
                     'side': side, 'rule': rule,
                     'bid': bid, 'ask': ask, 'bid_qty': bq, 'ask_qty': aq,
                     'spread': max(ask - bid, 0.0), 'cum_volume': cum_vol,
+                    'microprice': _microprice(bid, ask, bq, aq),
+                    'notional': qty * price,
+                    'aggression': _aggression(price, bid, ask),
+                    'gap_ms': gap_ms,
+                    'msg_seq': st.msg_seq,
                 })
 
                 # State + counters
@@ -474,6 +569,7 @@ def main() -> None:
                     parts.append(
                         f"{inst} ticks={st.n_buy+st.n_sell+st.n_unk} "
                         f"buy={st.n_buy} sell={st.n_sell} "
+                        f"qz={st.n_qty_zero} gap={st.n_gap} rev={st.n_reversal} "
                         f"delta_qty={st.cum_delta_qty:+.0f}"
                     )
                 log.info("heartbeat — " + " | ".join(parts))

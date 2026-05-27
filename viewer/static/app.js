@@ -47,6 +47,7 @@ const state = {
   dom_profile: {cells: [], n_snapshots: 0}, // session-wide resting profile
   positioning: null,                         // unified positioning snapshot
   positioning_timer: null,
+  pivots: null,                              // {pivots:{P,R1..3,S1..3}, prior_day:{...}}
   resync_timer: null,                       // periodic running-bucket resync
 };
 
@@ -174,6 +175,13 @@ async function fullReload () {
   state.snap = await fetch('/snapshot?' + q).then(r => r.json());
   state.n_ticks = state.snap.n_ticks || 0;
   rebuildIndex();
+  // Pivots: prior-day classic floor pivots. Stable for the whole session —
+  // fetch once on reload.
+  try {
+    const pq = new URLSearchParams({inst: state.inst, date: state.date});
+    const pr = await fetch('/pivots?' + pq).then(r => r.json());
+    state.pivots = (pr && !pr.error) ? pr : null;
+  } catch (e) { state.pivots = null; }
   redrawAll();
   setStatus('live ✓');
   openWS();
@@ -220,18 +228,30 @@ function renderPositioning (p) {
   const comp = document.getElementById('pos_composite');
   comp.classList.toggle('aligned', !!p.composite.aligned);
 
-  // Extra context on individual cards
+  // Extra context on individual cards. Each gets a freshness suffix so the
+  // user can tell at a glance which inputs are stale vs live (the panel
+  // refreshes every 5 s, but the underlying inputs update on different
+  // cadences — flow is a 5-min rolling avg, INST writes once/min, MACRO
+  // every several minutes).
+  const now = Date.now();
+  const ageStr = (updated_ms) => {
+    if (!updated_ms) return '—';
+    const sec = Math.max(0, Math.round((now - updated_ms) / 1000));
+    if (sec < 60)  return `${sec}s ago`;
+    if (sec < 3600) return `${Math.round(sec/60)}m ago`;
+    return `${(sec/3600).toFixed(1)}h ago`;
+  };
   document.querySelector('#pos_flow .pos-sub').textContent =
-    `${p.flow.label} · ${p.flow.n_ticks}t`;
+    `${p.flow.label} · ${p.flow.n_ticks}t · ${p.flow.window_min || 5}min win · ${ageStr(p.flow.updated_ms)}`;
   document.querySelector('#pos_resting .pos-sub').textContent =
-    `${p.resting.label} · b${fmtNum(p.resting.bid_qty)}/a${fmtNum(p.resting.ask_qty)}`;
+    `${p.resting.label} · b${fmtNum(p.resting.bid_qty)}/a${fmtNum(p.resting.ask_qty)} · ${ageStr(p.resting.updated_ms)}`;
   document.querySelector('#pos_institutions .pos-sub').textContent =
-    `${p.institutions.label} · conv ${p.institutions.conv.toFixed(2)}`;
+    `${p.institutions.label} · conv ${p.institutions.conv.toFixed(2)} · ${ageStr(p.institutions.updated_ms)}`;
   document.querySelector('#pos_macro .pos-sub').textContent =
-    `${p.macro.label} · conf ${(p.macro.confidence*100).toFixed(0)}%`;
+    `${p.macro.label} · conf ${(p.macro.confidence*100).toFixed(0)}% · ${ageStr(p.macro.updated_ms)}`;
 
   document.getElementById('pos_updated').textContent =
-    `updated ${new Date().toLocaleTimeString()}`;
+    `polled ${new Date().toLocaleTimeString()}`;
 }
 
 async function resyncRunningBucket () {
@@ -565,6 +585,38 @@ function redrawAll () {
   const yMid = candles[candles.length-1].close;
   const yHalfSpan = ((yHi0 - yLo0) / 2 + 2 * cs) / state.zoom_y;
   const yRange = [yMid - yHalfSpan, yMid + yHalfSpan];
+
+  // ── Pivot lines (classic floor pivots from prior day's OHLC) ──────────
+  // Drawn AFTER xRange/yRange are defined. Levels outside the visible
+  // y-window are skipped so labels don't hang in space.
+  if (state.pivots && state.pivots.pivots) {
+    const piv = state.pivots.pivots;
+    const levels = [
+      {k:'R3', v:piv.R3, color:'#b71c1c', dash:'dot',    weight:0.9},
+      {k:'R2', v:piv.R2, color:'#ef5350', dash:'dash',   weight:1.0},
+      {k:'R1', v:piv.R1, color:'#ef5350', dash:'solid',  weight:1.2},
+      {k:'P',  v:piv.P,  color:'#fdd835', dash:'dash',   weight:1.4},
+      {k:'S1', v:piv.S1, color:'#26a69a', dash:'solid',  weight:1.2},
+      {k:'S2', v:piv.S2, color:'#26a69a', dash:'dash',   weight:1.0},
+      {k:'S3', v:piv.S3, color:'#0d6e63', dash:'dot',    weight:0.9},
+    ];
+    for (const L of levels) {
+      if (L.v < yRange[0] - cs || L.v > yRange[1] + cs) continue;
+      shapes.push({
+        type:'line', xref:'x', yref:'y',
+        x0: xRange[0], x1: xRange[1], y0: L.v, y1: L.v,
+        line: {color: L.color, width: L.weight, dash: L.dash},
+        layer: 'below',
+      });
+      annos.push({
+        x: xRange[1], y: L.v, xref:'x', yref:'y',
+        text: `<b>${L.k}</b> ${L.v.toFixed(1)}`,
+        showarrow:false, xanchor:'right', yanchor:'middle',
+        bgcolor:'rgba(255,255,255,0.85)', bordercolor:L.color, borderwidth:1,
+        font:{size:9, color:L.color}, borderpad:2,
+      });
+    }
+  }
 
   // y-tick density: aim for ~10 labels regardless of cell size / zoom.
   // Round step to the nearest "nice" multiple of cell size.

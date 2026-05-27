@@ -23,6 +23,7 @@ import csv
 import json
 import logging
 import pathlib
+import time
 from datetime import date, datetime
 from typing import Optional
 
@@ -393,26 +394,33 @@ async def dom_profile(inst: str = Query(...), date: Optional[str] = None,
 # Composite is an equal-weighted mean (placeholder until the cross-feature
 # regression has enough data to estimate real weights).
 
-FLOW_LOOKBACK_MIN = 15      # footprint CVD window
+FLOW_LOOKBACK_MIN = 5       # footprint CVD window (tightened from 15 → 5 for
+                            # responsiveness — 15-min averaged out everything)
 FLOW_THRESHOLD    = 0.10    # |normalised CVD| above this triggers a direction
 REST_THRESHOLD    = 0.10    # |top-5 imbalance| above this triggers a direction
 
 
 def _positioning_flow(inst: str, day: str) -> dict:
-    """Compute normalised footprint flow over the last FLOW_LOOKBACK_MIN."""
+    """Compute normalised footprint flow over the last FLOW_LOOKBACK_MIN.
+    `updated_ms` is the freshest tick ts_ms — lets the UI show staleness."""
     p = _tick_path(inst, day)
     if not p.exists():
-        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0}
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0,
+                'updated_ms': 0, 'window_min': FLOW_LOOKBACK_MIN}
     try:
         df = pd.read_csv(p)
     except Exception:
-        return {'value': 0.0, 'dir': 0, 'label': 'err', 'n_ticks': 0}
+        return {'value': 0.0, 'dir': 0, 'label': 'err', 'n_ticks': 0,
+                'updated_ms': 0, 'window_min': FLOW_LOOKBACK_MIN}
     if df.empty:
-        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0}
-    cutoff_ms = int(df['ts_ms'].max() - FLOW_LOOKBACK_MIN * 60_000)
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0,
+                'updated_ms': 0, 'window_min': FLOW_LOOKBACK_MIN}
+    latest_ms = int(df['ts_ms'].max())
+    cutoff_ms = latest_ms - FLOW_LOOKBACK_MIN * 60_000
     win = df[df['ts_ms'] >= cutoff_ms]
     if win.empty:
-        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0}
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'n_ticks': 0,
+                'updated_ms': latest_ms, 'window_min': FLOW_LOOKBACK_MIN}
     sign = win['side'].map({'BUY': 1, 'SELL': -1}).fillna(0).astype(int)
     signed_qty = (win['qty'] * sign).sum()
     total_qty  = win['qty'].sum()
@@ -420,7 +428,8 @@ def _positioning_flow(inst: str, day: str) -> dict:
     direction = 1 if val > FLOW_THRESHOLD else (-1 if val < -FLOW_THRESHOLD else 0)
     label = 'buy agg' if direction == 1 else ('sell agg' if direction == -1 else 'balanced')
     return {'value': round(val, 3), 'dir': direction, 'label': label,
-            'n_ticks': int(len(win))}
+            'n_ticks': int(len(win)),
+            'updated_ms': latest_ms, 'window_min': FLOW_LOOKBACK_MIN}
 
 
 def _positioning_resting(inst: str, day: str) -> dict:
@@ -431,7 +440,7 @@ def _positioning_resting(inst: str, day: str) -> dict:
     total = bid_sum + ask_sum
     if total == 0:
         return {'value': 0.0, 'dir': 0, 'label': 'no data',
-                'wall_dist': None, 'bid_qty': 0, 'ask_qty': 0}
+                'bid_qty': 0, 'ask_qty': 0, 'updated_ms': int(d.get('ts_ms', 0))}
     imb = (bid_sum - ask_sum) / total
     direction = 1 if imb > REST_THRESHOLD else (-1 if imb < -REST_THRESHOLD else 0)
     label = 'bid heavy' if direction == 1 else \
@@ -442,39 +451,53 @@ def _positioning_resting(inst: str, day: str) -> dict:
     return {'value': round(imb, 3), 'dir': direction, 'label': label,
             'bid_qty': float(bid_sum), 'ask_qty': float(ask_sum),
             'best_bid_qty': float(best_bid_q),
-            'best_ask_qty': float(best_ask_q)}
+            'best_ask_qty': float(best_ask_q),
+            'updated_ms': int(d.get('ts_ms', 0))}
 
 
 def _positioning_institutions(inst: str) -> dict:
-    """Read option_flow conviction from v3/cache/option_flow_<INST>.json."""
+    """Read option_flow conviction from v3/cache/option_flow_<INST>.json.
+    Refresh cadence: tied to option_flow_daemon (typically ~1 / min)."""
     p = CACHE_DIR / f'option_flow_{inst}.json'
     if not p.exists():
-        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'conv': 0.0}
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'conv': 0.0,
+                'updated_ms': 0}
     try:
         d = json.loads(p.read_text())
+        # ts in file is ISO with tz; fall back to file mtime
+        ts_iso = d.get('ts')
+        if ts_iso:
+            updated_ms = int(datetime.fromisoformat(ts_iso).timestamp() * 1000)
+        else:
+            updated_ms = int(p.stat().st_mtime * 1000)
     except Exception:
-        return {'value': 0.0, 'dir': 0, 'label': 'err', 'conv': 0.0}
+        return {'value': 0.0, 'dir': 0, 'label': 'err', 'conv': 0.0,
+                'updated_ms': 0}
     conv = float(d.get('conviction', 0.0))
     band = int(d.get('conv_band', 0))
     direction = int(d.get('direction', 0)) or band
-    # Normalise conviction to [-1, +1]: typical scale is ±3
     val = max(-1.0, min(1.0, conv / 3.0))
     label = ('bull' if direction == 1 else ('bear' if direction == -1 else 'flat'))
     return {'value': round(val, 3), 'dir': direction, 'label': label,
             'conv': round(conv, 3), 'conv_band': band,
             'top_strike': (d.get('top_strikes') or [{}])[0].get('strike'),
-            'top_state':  (d.get('top_strikes') or [{}])[0].get('state')}
+            'top_state':  (d.get('top_strikes') or [{}])[0].get('state'),
+            'updated_ms': updated_ms}
 
 
 def _positioning_macro() -> dict:
-    """Read news_signal.json — score × confidence as magnitude."""
+    """Read news_signal.json — score × confidence as magnitude.
+    Refresh cadence: news/runner.py writes this on each scoring cycle (minutes)."""
     p = CACHE_DIR / 'news_signal.json'
     if not p.exists():
-        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'score': 0.0}
+        return {'value': 0.0, 'dir': 0, 'label': 'no data', 'score': 0.0,
+                'updated_ms': 0}
     try:
         d = json.loads(p.read_text())
+        updated_ms = int(p.stat().st_mtime * 1000)
     except Exception:
-        return {'value': 0.0, 'dir': 0, 'label': 'err', 'score': 0.0}
+        return {'value': 0.0, 'dir': 0, 'label': 'err', 'score': 0.0,
+                'updated_ms': 0}
     score = float(d.get('score', 0.0))
     conf  = float(d.get('confidence', 0.0))
     val   = max(-1.0, min(1.0, score * conf))
@@ -483,12 +506,126 @@ def _positioning_macro() -> dict:
             ('bear' if direction == -1 else 'neutral')
     return {'value': round(val, 3), 'dir': direction, 'label': label,
             'score': round(score, 3), 'confidence': round(conf, 3),
-            'n_clusters': int(d.get('n_clusters', 0))}
+            'n_clusters': int(d.get('n_clusters', 0)),
+            'updated_ms': updated_ms}
+
+
+# ─── Classic floor pivots — prior trading day's OHLC ────────────────────────
+def _prior_day_ohlc(inst: str, today: date) -> Optional[dict]:
+    """Find the most recent COMPLETED trading day before `today` and return
+    its 09:15-15:30 OHLC from the 1m candle cache."""
+    path = CACHE_DIR / f'candles_1m_{inst}.pkl'
+    if not path.exists():
+        return None
+    try:
+        import pickle
+        df = pickle.load(open(path, 'rb'))
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['ts']).dt.date
+    # Most recent date strictly before today
+    days = sorted(d for d in df['date'].unique() if d < today)
+    if not days:
+        return None
+    prior = days[-1]
+    sub = df[df['date'] == prior]
+    if sub.empty:
+        return None
+    return {
+        'date':  str(prior),
+        'open':  float(sub['open'].iloc[0]),
+        'high':  float(sub['high'].max()),
+        'low':   float(sub['low'].min()),
+        'close': float(sub['close'].iloc[-1]),
+    }
+
+
+def _classic_pivots(h: float, l: float, c: float) -> dict:
+    """Standard floor pivots from prior day's H/L/C."""
+    p = (h + l + c) / 3.0
+    rng = h - l
+    return {
+        'P':  round(p,        2),
+        'R1': round(2*p - l,  2),
+        'S1': round(2*p - h,  2),
+        'R2': round(p + rng,  2),
+        'S2': round(p - rng,  2),
+        'R3': round(h + 2*(p - l), 2),
+        'S3': round(l - 2*(h - p), 2),
+    }
+
+
+@app.get('/pivots')
+async def pivots(inst: str = Query(...), date: Optional[str] = None):
+    """Classic floor pivots from prior trading day's OHLC."""
+    if inst not in INSTRUMENTS:
+        return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
+    from datetime import date as _date
+    today = _date.fromisoformat(date) if date else _date.today()
+    ohlc = _prior_day_ohlc(inst, today)
+    if not ohlc:
+        return JSONResponse({'error': 'no prior-day data', 'inst': inst})
+    piv = _classic_pivots(ohlc['high'], ohlc['low'], ohlc['close'])
+    return JSONResponse({
+        'inst': inst, 'today': str(today),
+        'prior_day': ohlc,
+        'pivots': piv,
+    })
+
+
+# Throttle the positioning log writes so a chatty client (or multiple
+# browser tabs) doesn't bloat the file. 5 s matches the viewer's poll cadence.
+_POS_LOG_MIN_INTERVAL_S = 5.0
+_POS_LOG_LAST: dict[str, float] = {}
+
+
+def _latest_ltp_from_ticks(inst: str, day: str) -> Optional[float]:
+    """Return the most recent traded price for `inst` on `day` by reading
+    the tail of the tick CSV (cheap, ~4 KB seek-to-end)."""
+    p = _tick_path(inst, day)
+    if not p.exists():
+        return None
+    size = p.stat().st_size
+    try:
+        with p.open('rb') as f:
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode('utf-8', errors='ignore')
+        lines = [ln for ln in tail.split('\n') if ',' in ln]
+        if not lines:
+            return None
+        # Last row's `price` column is index 2 in the canonical schema:
+        # ts_ms,inst,price,qty,side,rule,bid,ask,bid_qty,ask_qty,spread,cum_volume
+        last = lines[-1].split(',')
+        return float(last[2])
+    except Exception:
+        return None
+
+
+def _log_positioning(inst: str, day: str, payload: dict) -> None:
+    """Append one JSON line to v3/cache/positioning_<INST>_<DATE>.ndjson.
+    Throttled to once per _POS_LOG_MIN_INTERVAL_S per (inst, day) so that
+    multiple browser tabs or chatty pollers don't bloat the file."""
+    now = time.time()
+    key = f'{inst}|{day}'
+    last = _POS_LOG_LAST.get(key, 0.0)
+    if now - last < _POS_LOG_MIN_INTERVAL_S:
+        return
+    _POS_LOG_LAST[key] = now
+    fp = CACHE_DIR / f'positioning_{inst}_{day.replace("-","")}.ndjson'
+    try:
+        with open(fp, 'a') as f:
+            f.write(json.dumps(payload, separators=(',', ':')) + '\n')
+    except Exception as e:
+        log.warning('positioning log write %s: %s', fp.name, e)
 
 
 @app.get('/positioning')
 async def positioning(inst: str = Query(...), date: Optional[str] = None):
-    """Return the unified positioning snapshot for one instrument."""
+    """Return the unified positioning snapshot for one instrument and
+    append it to the per-day NDJSON log for later forward-return analysis."""
     if inst not in INSTRUMENTS:
         return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
     day = date or datetime.now().strftime('%Y-%m-%d')
@@ -505,16 +642,37 @@ async def positioning(inst: str = Query(...), date: Optional[str] = None):
     comp_dir = 1 if comp > 0.10 else (-1 if comp < -0.10 else 0)
     comp_label = ('bullish' if comp_dir == 1 else
                   ('bearish' if comp_dir == -1 else 'mixed'))
-
-    return JSONResponse({
+    composite = {
+        'value': round(comp, 3), 'dir': comp_dir, 'label': comp_label,
+        'aligned': (flow['dir'] == rest['dir'] == inst_['dir'] == macro['dir']
+                    and flow['dir'] != 0),
+    }
+    body = {
         'inst': inst, 'date': day,
         'flow': flow, 'resting': rest,
         'institutions': inst_, 'macro': macro,
-        'composite': {'value': round(comp, 3), 'dir': comp_dir,
-                      'label': comp_label,
-                      'aligned': (flow['dir'] == rest['dir'] == inst_['dir'] == macro['dir']
-                                  and flow['dir'] != 0)},
-    })
+        'composite': composite,
+    }
+
+    # Persist for research — every 5 s, append a compact NDJSON line with
+    # the LTP anchor so forward-return analysis can compute "did price move
+    # in direction(composite) over next N min" later.
+    now = datetime.now()
+    ltp = _latest_ltp_from_ticks(inst, day)
+    log_row = {
+        'ts_iso': now.isoformat(timespec='seconds'),
+        'ts_ms':  int(now.timestamp() * 1000),
+        'inst':   inst,
+        'ltp':    ltp,
+        'flow':         flow,
+        'resting':      rest,
+        'institutions': inst_,
+        'macro':        macro,
+        'composite':    composite,
+    }
+    _log_positioning(inst, day, log_row)
+
+    return JSONResponse(body)
 
 
 # ─── WebSocket tail-streamer ─────────────────────────────────────────────────
