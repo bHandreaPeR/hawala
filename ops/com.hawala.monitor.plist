@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hawala production watchdog.
+
+  Install once:
+      cp ops/com.hawala.monitor.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.hawala.monitor.plist
+
+  Update / reload after editing monitor.py:
+      launchctl unload ~/Library/LaunchAgents/com.hawala.monitor.plist
+      launchctl load   ~/Library/LaunchAgents/com.hawala.monitor.plist
+
+  KeepAlive: true means if the monitor crashes, launchd respawns it
+  within seconds. RunAtLoad: true starts it immediately at boot.
+  ThrottleInterval prevents a crash-loop from hammering the system.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hawala.monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/anaconda3/bin/python3</string>
+        <string>-m</string>
+        <string>ops.monitor</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/trade_bot/monitor_launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/trade_bot/monitor_launchd.err</string>
+</dict>
+</plist>
