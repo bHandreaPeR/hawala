@@ -343,6 +343,20 @@ def _build_targets() -> list[Target]:
                 else 'log stale > 5 min'),
             restart_cmd=restart('alerts.index_1m_intraday'),
         ),
+        # spot_vix_recorder — polls spot indices + VIX every 60 s; ~60-s
+        # cadence + 5-min grace = log mtime threshold of 5 min is safe.
+        Target(
+            name='spot_vix_recorder',
+            proc_pattern=r'alerts\.spot_vix_recorder',
+            healthy=lambda: (
+                _process_running(r'alerts\.spot_vix_recorder') is not None
+                and (lambda a: a is not None and a < 300)(
+                    _file_age_seconds(LOG_DIR / 'spot_vix_recorder.log'))),
+            why_unhealthy=lambda: (
+                'process dead' if _process_running(r'alerts\.spot_vix_recorder') is None
+                else 'log stale > 5 min'),
+            restart_cmd=restart('alerts.spot_vix_recorder'),
+        ),
     ]
 
 

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily Groww order-history sync — fetches today's executed orders,
+  computes FIFO P&L pairs, appends to trade_logs/manual_trades_journal.csv.
+
+  Fires at 17:05 IST Mon-Fri (well after EOD at 15:30, before backup at 22:30).
+
+  Install:
+      cp ops/com.hawala.order_sync.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.hawala.order_sync.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hawala.order_sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/anaconda3/bin/python3</string>
+        <string>-m</string>
+        <string>alerts.order_sync</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/trade_bot/order_sync_launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/trade_bot/order_sync_launchd.err</string>
+</dict>
+</plist>
