@@ -24,7 +24,7 @@ import json
 import logging
 import pathlib
 import time
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime
 from typing import Optional
 
 import numpy as np
@@ -44,11 +44,26 @@ CELL_CHOICES = {'NIFTY': [2, 5, 10], 'BANKNIFTY': [5, 10, 20]}
 
 IMB_MULT, IMB_MIN_TICKS, VA_PCT = 3.0, 4, 0.70
 
+# Stall threshold for the WS streamer. If we see no new ticks for this long
+# during market hours, surface a {'type':'stall'} message so the UI can show
+# "feed stale" — the recorder's own watchdog will already be reconnecting.
+WS_STALL_THRESHOLD_SEC = 90.0
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('viewer')
 
 app = FastAPI(title='Hawala live footprint')
 app.mount('/static', StaticFiles(directory=str(STATIC)), name='static')
+
+
+def _market_hours_now() -> bool:
+    """True if `now` is on a weekday between 09:15 and 15:35 IST (server
+    is assumed to run in IST, matching the recorder cron). Used to gate
+    WS stall warnings so we don't fire them overnight."""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    return dtime(9, 15) <= now.time() <= dtime(15, 35)
 
 
 # ─── tick file IO ────────────────────────────────────────────────────────────
@@ -697,6 +712,8 @@ async def ws_endpoint(ws: WebSocket, inst: str = Query(...),
     last_byte = p.stat().st_size if p.exists() else -1
 
     last_depth_ts = 0
+    last_tick_wall = time.time()
+    stall_notified = False
     try:
         while True:
             await asyncio.sleep(poll_ms / 1000.0)
@@ -722,6 +739,26 @@ async def ws_endpoint(ws: WebSocket, inst: str = Query(...),
                     })
                 await ws.send_json({'type': 'ticks', 'inst': inst,
                                     'rows': rows, 'last_byte': last_byte})
+                last_tick_wall = time.time()
+                if stall_notified:
+                    await ws.send_json({'type': 'resume', 'inst': inst,
+                                        'wall_ms': int(last_tick_wall * 1000)})
+                    stall_notified = False
+            else:
+                # Surface a stall warning ONCE per outage, only during market
+                # hours (avoid noisy alerts before 09:15 or after 15:35).
+                now_wall = time.time()
+                stall_age = now_wall - last_tick_wall
+                if (not stall_notified and stall_age > WS_STALL_THRESHOLD_SEC
+                        and _market_hours_now()):
+                    log.warning("WS stall inst=%s age=%.0fs — recorder may "
+                                "be reconnecting", inst, stall_age)
+                    await ws.send_json({
+                        'type': 'stall', 'inst': inst,
+                        'stall_age_s': round(stall_age, 1),
+                        'since_ms': int(last_tick_wall * 1000),
+                    })
+                    stall_notified = True
 
             # 2) depth snapshot — push when ts_ms advances
             d = _latest_depth(inst, day)

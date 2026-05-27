@@ -338,6 +338,11 @@ function openWS () {
       state.depth = {ts_ms: m.ts_ms, bids: m.bids, asks: m.asks};
       state.depth_dirty = true;
     }
+    // Feed-stall messages from the server-side WS streamer
+    // (viewer/live_server.py emits these when no fresh ticks for ≥90 s
+    // during market hours — the recorder is probably reconnecting).
+    if (m.type === 'stall') showStallBadge(m.stall_age_s);
+    if (m.type === 'resume') hideStallBadge();
   });
 
   // Initial depth fetch — server pushes only on new ts; seed via REST.
@@ -843,6 +848,35 @@ function setStatus (txt, err=false) {
   const $s = document.getElementById('status');
   $s.textContent = txt;
   $s.classList.toggle('err', !!err);
+}
+
+// ─── Feed-stall badge ───────────────────────────────────────────────────────
+// Server sends {type:'stall', stall_age_s} when no ticks for ≥90 s during
+// market hours, and {type:'resume'} when ticks come back. We show a small
+// pulsing chip in the topbar so the user knows the recorder is reconnecting
+// (vs the market genuinely being quiet). The badge is created lazily on
+// first stall to keep the HTML clean.
+function _ensureStallBadge () {
+  let el = document.getElementById('stall_badge');
+  if (el) return el;
+  el = document.createElement('span');
+  el.id = 'stall_badge';
+  el.className = 'stall-badge';
+  el.title = 'No fresh ticks reaching the viewer — recorder likely reconnecting. '
+           + 'The process monitor will restart it if it doesn’t recover.';
+  document.querySelector('.controls')?.appendChild(el);
+  return el;
+}
+
+function showStallBadge (stallAgeSec) {
+  const el = _ensureStallBadge();
+  el.textContent = `⚠ feed stale ${Math.round(stallAgeSec)}s`;
+  el.style.display = 'inline-block';
+}
+
+function hideStallBadge () {
+  const el = document.getElementById('stall_badge');
+  if (el) el.style.display = 'none';
 }
 
 document.addEventListener('DOMContentLoaded', bootstrap);
