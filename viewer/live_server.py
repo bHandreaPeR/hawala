@@ -53,12 +53,8 @@ app.mount('/static', StaticFiles(directory=str(STATIC)), name='static')
 
 # ─── tick file IO ────────────────────────────────────────────────────────────
 def _tick_path(inst: str, day: str) -> pathlib.Path:
-    # Prefer ticks_v2_* (callback recorder w/ qty=0 filter + reversal handling)
-    # when it exists for the day, since v1 has wedged silently three times
-    # today on cum_volume reversals. Falls back to v1 if v2 not running.
-    v2 = CACHE_DIR / f'ticks_v2_{inst}_{day.replace("-","")}.csv'
-    if v2.exists() and v2.stat().st_size > 200:   # non-empty (header is ~150 B)
-        return v2
+    # v1 (alerts.tick_recorder) now carries the qty=0 filter + reversal
+    # handling backported from the v2 experiment. v2 recorder retired.
     return CACHE_DIR / f'ticks_{inst}_{day.replace("-","")}.csv'
 
 
@@ -256,10 +252,6 @@ async def snapshot(inst: str = Query(...), date: Optional[str] = None,
 
 # ─── Depth (resting order book) ──────────────────────────────────────────────
 def _depth_path(inst: str, day: str) -> pathlib.Path:
-    # Same fallback logic as _tick_path — prefer v2 depth when fresh.
-    v2 = CACHE_DIR / f'depth_v2_{inst}_{day.replace("-","")}.csv'
-    if v2.exists() and v2.stat().st_size > 200:
-        return v2
     return CACHE_DIR / f'depth_{inst}_{day.replace("-","")}.csv'
 
 
