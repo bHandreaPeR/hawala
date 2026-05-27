@@ -609,9 +609,9 @@ function redrawAll () {
         layer: 'below',
       });
       annos.push({
-        x: xRange[1], y: L.v, xref:'x', yref:'y',
+        x: xRange[0], y: L.v, xref:'x', yref:'y',
         text: `<b>${L.k}</b> ${L.v.toFixed(1)}`,
-        showarrow:false, xanchor:'right', yanchor:'middle',
+        showarrow:false, xanchor:'left', yanchor:'middle',
         bgcolor:'rgba(255,255,255,0.85)', bordercolor:L.color, borderwidth:1,
         font:{size:9, color:L.color}, borderpad:2,
       });
