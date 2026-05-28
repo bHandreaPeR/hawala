@@ -57,6 +57,7 @@ const state = {
   pivots: null,                              // {pivots:{P,R1..3,S1..3}, prior_day:{...}}
   vol_profile: null,                         // composite VPVR {cells, poc, vah, val, hvn, lvn, prior_pocs}
   vp_scope: 'prior_day',                     // 'prior_day' | 'week'
+  option_levels: null,                       // option-OI S&R {ce_resistance, pe_support, max_pain, ...}
   resync_timer: null,                       // periodic running-bucket resync
 };
 
@@ -194,6 +195,15 @@ async function fetchVolProfile () {
   state.dirty = true;
 }
 
+async function fetchOptionLevels () {
+  try {
+    const q = new URLSearchParams({inst: state.inst, date: state.date});
+    const r = await fetch('/option_levels?' + q).then(r => r.json());
+    state.option_levels = (r && r.available) ? r : null;
+  } catch (e) { state.option_levels = null; }
+  state.dirty = true;
+}
+
 function updateZoomLabels () {
   const xl = document.getElementById('zoom_x_lbl');
   const yl = document.getElementById('zoom_y_lbl');
@@ -242,6 +252,9 @@ async function fullReload () {
   // Composite volume profile (prior-day / weekly) — stable for the session,
   // fetch once on reload. Re-fetched when the user toggles scope.
   await fetchVolProfile();
+  // Option-OI S&R levels — these EVOLVE intraday, so also re-fetched by the
+  // 5s resync loop (see resyncRunningBucket) to track positioning shifts.
+  await fetchOptionLevels();
   redrawAll();
   setStatus('live ✓');
   openWS();
@@ -346,6 +359,9 @@ async function resyncRunningBucket () {
     // Refresh the session DOM profile on the same 5s cadence — the running
     // candle and the resting-order picture stay in lockstep with truth.
     fetchDomProfile();
+    // Option-OI levels shift as positioning builds intraday — re-fetch so the
+    // CE-resistance / PE-support / max-pain lines track through the day.
+    fetchOptionLevels();
   } catch (e) { /* network blips are fine, next tick will retry */ }
 }
 
@@ -820,6 +836,37 @@ function redrawAll () {
       });
     });
     }  // end if (state.analysis_mode) — experimental VP overlays
+  }
+
+  // ── Option-OI institutional levels (Clean mode — these are KEY) ────────
+  // CE-resistance (call wall), PE-support (put wall), Max Pain magnet.
+  // Institutional positioning levels — shown in Clean mode alongside pivots
+  // because they're standard/validated, not experimental heuristics. They
+  // re-poll every 5s so the lines TRACK as OI builds through the day.
+  if (state.option_levels && state.option_levels.available) {
+    const ol = state.option_levels;
+    const inView2 = (y) => y != null && y >= yRange[0] - cs && y <= yRange[1] + cs;
+    const staleTag = ol.stale ? ` ⚠stale ${ol.day_used.slice(5)}` : '';
+    const olLevels = [
+      {px: ol.ce_resistance, name: 'CE-wall', color: '#c62828', dash: 'dash',
+       note: 'call-OI resistance (writers defend above)'},
+      {px: ol.pe_support,    name: 'PE-wall', color: '#2e7d32', dash: 'dash',
+       note: 'put-OI support (writers defend below)'},
+      {px: ol.max_pain,      name: 'MaxPain', color: '#ff8f00', dash: 'dot',
+       note: 'max-pain magnet (writers lose least here)'},
+    ];
+    for (const L of olLevels) {
+      if (!inView2(L.px)) continue;
+      shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
+        x0:xRange[0], x1:xRange[1], y0:L.px, y1:L.px,
+        line:{color:L.color, width:1.3, dash:L.dash}});
+      annos.push({x:xRange[1], y:L.px, xref:'x', yref:'y',
+        text:`<b>${L.name}</b> ${L.px.toFixed(0)}${L.name==='CE-wall'?staleTag:''}`,
+        showarrow:false, xanchor:'right', yanchor:'top',
+        bgcolor:'rgba(255,255,255,0.85)', bordercolor:L.color, borderwidth:1,
+        font:{size:9, color:L.color}, borderpad:2,
+        hovertext:`${L.note} · PCR ${ol.pcr_oi}`});
+    }
   }
 
   // ── High-probability entry markers (scored, multi-factor) ─────────────

@@ -178,6 +178,31 @@ def _check_positioning(inst: str, side: str) -> tuple[bool, str]:
         return False, f'POSITIONING CONTRADICTS: composite {v:+.2f} ({comp.get("label")}) vs trade'
     return True, f'positioning not contradicting (composite {v:+.2f})'
 
+def _check_option_walls(inst: str, side: str) -> tuple[bool, str]:
+    """Institutional option-OI walls in the trade's path: a long into a fat
+    CE-OI resistance wall, or a short into a fat PE-OI support wall, is the
+    exact context the 11am trade was blind to (buying a CE into where call
+    writers sit). VETO if a wall is within ~0.4% of the entry."""
+    ol = _get(f'/option_levels?inst={inst}')
+    if not ol or not ol.get('available'):
+        return True, 'option-OI levels unavailable'
+    if ol.get('stale'):
+        return True, f'option-OI stale ({ol.get("day_used")}) — not vetoing on old OI'
+    px = _current_price(inst)
+    if px is None:
+        return True, 'no price for option-wall check'
+    thr = px * 0.004
+    if side == 'CE':   # long → CE resistance wall above blocks
+        wall = ol.get('ce_resistance')
+        if wall is not None and px <= wall <= px + thr:
+            return False, f'OPTION WALL: CE-OI resistance {wall:.0f} just {wall-px:.0f} pts above (call writers defending)'
+    else:              # short → PE support wall below blocks
+        wall = ol.get('pe_support')
+        if wall is not None and px - thr <= wall <= px:
+            return False, f'OPTION WALL: PE-OI support {wall:.0f} just {px-wall:.0f} pts below (put writers defending)'
+    return True, f'no option-OI wall in path (MaxPain {ol.get("max_pain")}, PCR {ol.get("pcr_oi")})'
+
+
 def _check_flow(inst: str, side: str) -> tuple[bool, str]:
     snap = _get(f'/snapshot?inst={inst}&tf=5min')
     if not snap or not snap.get('candles'):
@@ -207,6 +232,7 @@ def validate(path: pathlib.Path, inst: str, m: re.Match):
         _check_expiry(inst, today),
         _check_thesis_flip(path, inst, side, sig_dt),
         _check_level_block(inst, side, cell),
+        _check_option_walls(inst, side),
         _check_positioning(inst, side),
         _check_flow(inst, side),
     ]

@@ -547,6 +547,122 @@ def _build_volume_profile(inst: str, scope: str, cell_size: float) -> dict:
     return out
 
 
+# ─── Option OI levels (intraday-tracking institutional S&R) ─────────────────
+# Reads option_oi_1m_<INST>.pkl (per-strike CE/PE OI captured every minute by
+# option_flow_daemon). Uses the LATEST snapshot per strike so the levels
+# EVOLVE through the day as positioning builds — the viewer re-polls to track.
+#   PE-OI support     = strike with highest put OI (writers defend below)
+#   CE-OI resistance  = strike with highest call OI (writers defend above)
+#   Max Pain          = strike minimising total writer payout (expiry magnet)
+#   OI walls          = top strikes by CE / PE OI
+def _build_option_levels(inst: str, day: str) -> dict:
+    empty = {'inst': inst, 'available': False, 'reason': 'no data'}
+    p = CACHE_DIR / f'option_oi_1m_{inst}.pkl'
+    if not p.exists():
+        return empty
+    try:
+        store = pickle.load(open(p, 'rb'))
+    except Exception as e:
+        return {**empty, 'reason': f'load err: {e}'}
+    if day not in store or not store[day]:
+        # Fall back to the most recent cached day (flag as stale).
+        days = sorted([d for d in store.keys() if store[d]])
+        if not days:
+            return empty
+        day_used, stale = days[-1], (days[-1] != day)
+    else:
+        day_used, stale = day, False
+    strikes = store[day_used]
+
+    ce_oi, pe_oi = {}, {}
+    latest_ms = 0
+    for K, sides in strikes.items():
+        try:
+            kf = float(K)
+        except (TypeError, ValueError):
+            continue
+        for side, dst in (('CE', ce_oi), ('PE', pe_oi)):
+            df = sides.get(side)
+            if df is None or not hasattr(df, 'columns') or 'oi' not in df.columns or not len(df):
+                continue
+            ser = df['oi'].dropna()
+            ser = ser[ser > 0]
+            if ser.empty:
+                continue
+            dst[kf] = float(ser.iloc[-1])          # latest OI = current
+            try:
+                ts = df['ts'].iloc[-1]
+                latest_ms = max(latest_ms, int(pd.Timestamp(ts).timestamp() * 1000))
+            except Exception:
+                pass
+    if not ce_oi and not pe_oi:
+        return {**empty, 'reason': 'no non-zero OI', 'day_used': day_used}
+
+    # Spot reference for day_used — needed to filter out far-OTM round-strike
+    # OI artifacts (e.g. a 60000 BANKNIFTY strike with huge OI when spot is
+    # 55000 is NOT support). Use that day's last 1m close; fall back to the
+    # OI-weighted strike midpoint.
+    spot = None
+    try:
+        cpath = CACHE_DIR / f'candles_1m_{inst}.pkl'
+        if cpath.exists():
+            cdf = pickle.load(open(cpath, 'rb'))
+            cdf = cdf[pd.to_datetime(cdf['ts']).dt.date == date.fromisoformat(day_used)]
+            if not cdf.empty:
+                spot = float(cdf['close'].iloc[-1])
+    except Exception:
+        spot = None
+    if spot is None:
+        allk = list(ce_oi) + list(pe_oi)
+        spot = sum(allk) / len(allk) if allk else None
+
+    # Band = strikes within ±5% of spot (the liquid, meaningful S&R zone).
+    def _in_band(k):
+        return spot is None or abs(k - spot) <= 0.05 * spot
+    ce_band = {k: v for k, v in ce_oi.items() if _in_band(k)} or ce_oi
+    pe_band = {k: v for k, v in pe_oi.items() if _in_band(k)} or pe_oi
+    # Resistance = highest CE-OI strike AT/ABOVE spot; support = highest
+    # PE-OI strike AT/BELOW spot (fall back to band max if none on the side).
+    ce_above = {k: v for k, v in ce_band.items() if spot is None or k >= spot} or ce_band
+    pe_below = {k: v for k, v in pe_band.items() if spot is None or k <= spot} or pe_band
+    ce_res = max(ce_above, key=ce_above.get) if ce_above else None
+    pe_sup = max(pe_below, key=pe_below.get) if pe_below else None
+
+    # Max pain over the union strike grid.
+    grid = sorted(set(ce_oi) | set(pe_oi))
+    max_pain = None
+    if grid:
+        best, best_pay = None, None
+        for S in grid:
+            call_pay = sum(oi * max(S - k, 0) for k, oi in ce_oi.items())
+            put_pay  = sum(oi * max(k - S, 0) for k, oi in pe_oi.items())
+            pay = call_pay + put_pay
+            if best_pay is None or pay < best_pay:
+                best_pay, best = pay, S
+        max_pain = best
+
+    def _top(d, n=3):
+        return [{'strike': k, 'oi': round(v)} for k, v in
+                sorted(d.items(), key=lambda kv: -kv[1])[:n]]
+
+    pcr = round(sum(pe_oi.values()) / sum(ce_oi.values()), 3) if ce_oi else None
+    return {
+        'inst': inst, 'available': True, 'stale': stale, 'day_used': day_used,
+        'updated_ms': latest_ms, 'spot_ref': round(spot, 1) if spot else None,
+        'ce_resistance': ce_res, 'pe_support': pe_sup, 'max_pain': max_pain,
+        'pcr_oi': pcr,
+        'ce_walls': _top(ce_band), 'pe_walls': _top(pe_band),
+    }
+
+
+@app.get('/option_levels')
+async def option_levels(inst: str = Query(...), date: Optional[str] = None):
+    if inst not in INSTRUMENTS and inst != 'SENSEX':
+        return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
+    day = date or datetime.now().strftime('%Y-%m-%d')
+    return JSONResponse(_build_option_levels(inst, day))
+
+
 @app.get('/volume_profile')
 async def volume_profile(inst: str = Query(...),
                           scope: str = 'prior_day',
