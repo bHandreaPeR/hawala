@@ -608,6 +608,13 @@ def main() -> None:
     last_dns_check     = time.time()
     reconnect_attempts = 0             # only resets when fresh ticks return
 
+    # Non-trading day? exit cleanly. Holiday/weekend daemons used to spin
+    # in the wait loop all day producing zero ticks; calendar gate fixes it.
+    from ops.market_calendar import is_trading_day, holiday_reason
+    if not is_trading_day():
+        log.info('non-trading day (%s) — exiting', holiday_reason())
+        return
+
     # If cron fired us slightly pre-market (e.g. 09:12), wait — don't exit.
     while _running and not _market_open_now():
         now = datetime.now()

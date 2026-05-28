@@ -116,6 +116,12 @@ def main() -> None:
 
     log.info('boot — poll=%.0fs end=%d', POLL_SEC, END_HHMM)
 
+    # Non-trading day gate — weekends/holidays exit cleanly
+    from ops.market_calendar import is_trading_day, holiday_reason
+    if not is_trading_day():
+        log.info('non-trading day (%s) — exiting', holiday_reason())
+        return
+
     # If cron fired us slightly before 09:15 (e.g. 09:12), wait — don't exit.
     while not _market_open_now():
         now = datetime.now()

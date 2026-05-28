@@ -145,6 +145,12 @@ def main() -> None:
     log.info('boot — poll=%.0fs end=%d insts=%s',
              POLL_SEC, END_HHMM, [i[0] for i in INSTRUMENTS])
 
+    # Non-trading day gate — exit cleanly on weekends/holidays
+    from ops.market_calendar import is_trading_day, holiday_reason
+    if not is_trading_day():
+        log.info('non-trading day (%s) — exiting', holiday_reason())
+        return
+
     # Pre-market wait — same robustness pattern as tick_recorder
     while not _market_open_now():
         now = datetime.now()

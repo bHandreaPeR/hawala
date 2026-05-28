@@ -213,8 +213,13 @@ class TargetState:
 
 
 def _market_hours_now() -> bool:
+    """True only if we're in the intraday trading window of a NSE trading day.
+    Honours weekends + the holiday list in ops/market_holidays.json — so on
+    holidays (e.g. 2026-05-28), market_hours_only health checks correctly skip
+    instead of triggering restart cascades against silent-by-design daemons."""
+    from ops.market_calendar import is_trading_day
     now = datetime.now()
-    if now.weekday() >= 5:
+    if not is_trading_day(now.date()):
         return False
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
