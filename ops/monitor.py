@@ -370,6 +370,16 @@ def _build_targets() -> list[Target]:
                 else 'log stale > 5 min'),
             restart_cmd=restart('alerts.spot_vix_recorder'),
         ),
+        # signal_validator — only writes a log line when a signal fires, so a
+        # quiet validator (no signals all day, the common case) is HEALTHY.
+        # Process-alive check only; no log-freshness requirement.
+        Target(
+            name='signal_validator',
+            proc_pattern=r'alerts\.signal_validator',
+            healthy=lambda: _process_running(r'alerts\.signal_validator') is not None,
+            why_unhealthy=lambda: 'process dead',
+            restart_cmd=restart('alerts.signal_validator'),
+        ),
     ]
 
 
