@@ -240,6 +240,15 @@ def _build_snapshot(inst: str, day: str, tf: str, cell_size: float) -> dict:
 @app.get('/', response_class=HTMLResponse)
 async def index(request: Request):
     html = (STATIC / 'index.html').read_text(encoding='utf-8')
+    # Cache-bust app.js + style.css by file mtime so a browser never serves
+    # a stale JS against a fresh HTML (which caused the 'stuck on loading'
+    # bug when an old cached app.js referenced DOM the new HTML lacked, or
+    # vice-versa). Appends ?v=<mtime> to each asset reference.
+    for asset in ('app.js', 'style.css'):
+        p = STATIC / asset
+        if p.exists():
+            ver = int(p.stat().st_mtime)
+            html = html.replace(f'/static/{asset}', f'/static/{asset}?v={ver}')
     return HTMLResponse(html)
 
 

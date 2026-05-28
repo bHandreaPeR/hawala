@@ -101,12 +101,16 @@ async function bootstrap () {
   });
   document.getElementById('reload').addEventListener('click', fullReload);
 
-  // ── Volume-profile scope toggle ───────────────────────────────────────
-  document.getElementById('vp_scope').addEventListener('click', async (e) => {
-    state.vp_scope = state.vp_scope === 'prior_day' ? 'week' : 'prior_day';
-    e.target.textContent = state.vp_scope === 'week' ? 'VP: week' : 'VP: prior day';
-    await fetchVolProfile();
-  });
+  // ── Volume-profile scope toggle (defensive: button may be absent if an
+  //     old cached index.html is being served — never let that break boot) ─
+  const vpBtn = document.getElementById('vp_scope');
+  if (vpBtn) {
+    vpBtn.addEventListener('click', async (e) => {
+      state.vp_scope = state.vp_scope === 'prior_day' ? 'week' : 'prior_day';
+      e.target.textContent = state.vp_scope === 'week' ? 'VP: week' : 'VP: prior day';
+      await fetchVolProfile();
+    });
+  }
 
   // ── Zoom buttons ──────────────────────────────────────────────────────
   const stepZoom = (axis, dir) => {
