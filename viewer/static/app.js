@@ -795,56 +795,100 @@ function redrawAll () {
     });
   }
 
-  // ── Bounce / rejection / entry markers ─────────────────────────────────
-  // Ties the level map to order-flow behaviour. For each candle, check if it
-  // INTERACTED with a significant level (POC / VAH / VAL / HVN / pivot) — i.e.
-  // its wick pierced the level but it closed back on the origin side — AND the
-  // bar's delta confirms the rejection. That's a bounce / possible entry:
-  //   ▲ green = bullish reaction at support (wick below level, closed above,
-  //             buy delta) → long candidate
-  //   ▼ red   = bearish reaction at resistance (wick above level, closed
-  //             below, sell delta) → short candidate
-  // Deliberately conservative so the chart shows a FEW high-quality marks,
-  // not noise.
-  if (state.vol_profile || state.pivots) {
-    // Assemble the significant levels once.
-    const sig = [];
-    const vp2 = state.vol_profile;
-    if (vp2) {
-      if (vp2.poc != null) sig.push({px: vp2.poc, name: 'POC'});
-      if (vp2.vah != null) sig.push({px: vp2.vah, name: 'VAH'});
-      if (vp2.val != null) sig.push({px: vp2.val, name: 'VAL'});
-      (vp2.hvn || []).forEach(h => sig.push({px: h, name: 'HVN'}));
-    }
-    if (state.pivots && state.pivots.pivots) {
-      const P = state.pivots.pivots;
-      ['R1','P','S1'].forEach(k => sig.push({px: P[k], name: k}));
-    }
-    const tol = cs * 1.0;   // "touch" tolerance = 1 cell
-    for (const c of candles) {
+  // ── High-probability entry markers (scored, multi-factor) ─────────────
+  // The old version fired on ANY candle touching ANY of ~8 levels — pure
+  // noise. This requires a CONFLUENCE of evidence and only marks setups
+  // scoring ≥ ENTRY_MIN. Factors (each adds points):
+  //   level quality   value-area EDGE (VAL/VAH) or naked POC = 2;
+  //                   pivot-confluence (VP level ≈ floor pivot) = +2;
+  //                   POC = 1; (interior HVN alone never triggers)
+  //   rejection wick  rejecting wick ≥ 55% of the bar's range = 2
+  //   order flow      reversal-direction delta ≥ session 70th pctile = 2
+  //   absorption      high delta + tiny body at the level = +1
+  //   DOM wall        persistent resting wall (bid for longs / ask for
+  //                   shorts) within 1 cell of the level = +1
+  // A genuine bounce usually scores 6-8; random touches score 1-3.
+  // Threshold 6 requires ~3 strong factors stacking (e.g. value-edge +
+  // confluence + rejection wick, or value-edge + wick + significant delta)
+  // — deliberately rare. Lower to 5 if you want more candidates.
+  const ENTRY_MIN = 6;
+  if (state.vol_profile && candles.length >= 3) {
+    const vp2  = state.vol_profile;
+    const piv  = (state.pivots && state.pivots.pivots) || {};
+    const lastClose = candles[candles.length - 1].close;
+    const tol  = cs * 1.0;
+    const confTol = cs * 1.5;   // VP level ≈ pivot → confluence
+
+    // Build support + resistance level sets with a base quality score.
+    const pivVals = ['R1','R2','R3','P','S1','S2','S3']
+      .map(k => piv[k]).filter(v => v != null);
+    const isConfluent = (px) => pivVals.some(pv => Math.abs(pv - px) <= confTol);
+    const sup = [], res = [];
+    if (vp2.val != null) sup.push({px:vp2.val, name:'VAL', base:2});
+    if (vp2.vah != null) res.push({px:vp2.vah, name:'VAH', base:2});
+    if (vp2.poc != null) { sup.push({px:vp2.poc,name:'POC',base:1});
+                           res.push({px:vp2.poc,name:'POC',base:1}); }
+    (vp2.prior_pocs || []).forEach(pp => {
+      (pp.poc < lastClose ? sup : res).push(
+        {px: pp.poc, name:`nPOC·${pp.date.slice(5)}`, base:2});
+    });
+
+    // DOM persistence lookup — is there a resting wall near a price?
+    const domCells = (state.dom_profile && state.dom_profile.cells) || [];
+    const domWall = (px, side) => domCells.some(dc =>
+      Math.abs(dc.cell - px) <= tol &&
+      (side === 'bid' ? dc.bid_persistence : dc.ask_persistence) >= 0.30);
+
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i];
+      const rng = Math.max(c.high - c.low, 1e-6);
+      const body = Math.abs(c.close - c.open);
       const d = c.delta_qty || 0;
-      for (const L of sig) {
-        if (L.px == null) continue;
-        // Bullish: low wicked at/below level, close finished above it, buy delta
-        const bullReact = c.low <= L.px + tol && c.close > L.px && d > 0
-                          && c.close >= c.open;
-        // Bearish: high wicked at/above level, close finished below it, sell delta
-        const bearReact = c.high >= L.px - tol && c.close < L.px && d < 0
-                          && c.close <= c.open;
-        if (bullReact) {
-          annos.push({x:c.bucket, y:c.low - 1.4*cs, xref:'x', yref:'y',
-            text:'▲', showarrow:false, font:{size:12, color:'#26a69a'},
-            hovertext:`Bullish reaction at ${L.name} ${L.px.toFixed(0)} — `
-                    + `wick rejected, closed above, +delta ${fmtNum(d)}. Long candidate.`});
-          break;   // one marker per candle
-        }
-        if (bearReact) {
-          annos.push({x:c.bucket, y:c.high + 1.4*cs, xref:'x', yref:'y',
-            text:'▼', showarrow:false, font:{size:12, color:'#ef5350'},
-            hovertext:`Bearish reaction at ${L.name} ${L.px.toFixed(0)} — `
-                    + `wick rejected, closed below, -delta ${fmtNum(d)}. Short candidate.`});
-          break;
-        }
+      const lowerWick = Math.min(c.open, c.close) - c.low;
+      const upperWick = c.high - Math.max(c.open, c.close);
+      const absorb = Math.abs(d) >= p70Delta && p70Delta > 0 && body <= 0.6*medBody;
+
+      // ── LONG: rejection of a support level ──
+      let bestL = null, bestScore = 0;
+      for (const L of sup) {
+        if (c.low > L.px + tol || c.close <= L.px) continue;  // must wick+reclaim
+        let s = L.base;
+        if (isConfluent(L.px))               s += 2;
+        if (lowerWick / rng >= 0.55)          s += 2;
+        if (d > 0 && d >= p70Delta)           s += 2;
+        if (absorb && d > 0)                  s += 1;
+        if (domWall(L.px, 'bid'))             s += 1;
+        if (s > bestScore) { bestScore = s; bestL = L; }
+      }
+      if (bestL && bestScore >= ENTRY_MIN) {
+        annos.push({x:c.bucket, y:c.low - 1.5*cs, xref:'x', yref:'y',
+          text:'▲', showarrow:false, font:{size:13, color:'#1b5e20'},
+          hovertext:`LONG candidate · score ${bestScore} · rejected ${bestL.name} `
+                  + `${bestL.px.toFixed(0)}${isConfluent(bestL.px)?' (pivot confluence)':''} · `
+                  + `+delta ${fmtNum(d)}${absorb?' · absorption':''}`
+                  + `${domWall(bestL.px,'bid')?' · bid-wall':''}`});
+        continue;   // one marker per candle
+      }
+
+      // ── SHORT: rejection of a resistance level ──
+      bestL = null; bestScore = 0;
+      for (const L of res) {
+        if (c.high < L.px - tol || c.close >= L.px) continue;
+        let s = L.base;
+        if (isConfluent(L.px))               s += 2;
+        if (upperWick / rng >= 0.55)          s += 2;
+        if (d < 0 && Math.abs(d) >= p70Delta) s += 2;
+        if (absorb && d < 0)                  s += 1;
+        if (domWall(L.px, 'ask'))             s += 1;
+        if (s > bestScore) { bestScore = s; bestL = L; }
+      }
+      if (bestL && bestScore >= ENTRY_MIN) {
+        annos.push({x:c.bucket, y:c.high + 1.5*cs, xref:'x', yref:'y',
+          text:'▼', showarrow:false, font:{size:13, color:'#b71c1c'},
+          hovertext:`SHORT candidate · score ${bestScore} · rejected ${bestL.name} `
+                  + `${bestL.px.toFixed(0)}${isConfluent(bestL.px)?' (pivot confluence)':''} · `
+                  + `-delta ${fmtNum(d)}${absorb?' · absorption':''}`
+                  + `${domWall(bestL.px,'ask')?' · ask-wall':''}`});
       }
     }
   }
