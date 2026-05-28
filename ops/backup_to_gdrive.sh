@@ -38,6 +38,13 @@
 set -o pipefail
 # (intentionally NOT using `set -u` — bash 3.2 nullglob expansions trip it)
 
+# launchd jobs run with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) that
+# does NOT include Homebrew, so `rclone` (in /opt/homebrew/bin) isn't found.
+# The 2026-05-27 22:39 + 2026-05-28 22:30 scheduled backups failed silently
+# for exactly this reason while the manual runs (full shell PATH) succeeded.
+# Prepend the common Homebrew + conda locations so scheduled runs find rclone.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/anaconda3/bin:$PATH"
+
 ROOT="/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2"
 GDRIVE_REMOTE="gdrive:hawala"
 KEEP_DAYS=60
