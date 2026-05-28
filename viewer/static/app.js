@@ -36,6 +36,11 @@ const state = {
   paused: false, autoscroll: true,
   view_rev: 0,        // bumps when a button forces a programmatic view change
   force_range: false, // one-shot: apply computed range on the next redraw
+  // Clean mode (default) = candles + key levels (POC/VAH/VAL + pivots) +
+  // positioning only. Analysis mode reveals the experimental, UNVALIDATED
+  // overlays (entry markers, absorption/reversal badges, HVN/LVN, naked POCs)
+  // — for study, never for trading. Persisted so it stays Clean across reloads.
+  analysis_mode: localStorage.getItem('hawala_analysis_mode') === '1',
   zoom_x: _stored('hawala_zoom_x', 1.0),
   zoom_y: _stored('hawala_zoom_y', 1.0),
   snap: null,
@@ -116,6 +121,22 @@ async function bootstrap () {
       state.vp_scope = state.vp_scope === 'prior_day' ? 'week' : 'prior_day';
       e.target.textContent = state.vp_scope === 'week' ? 'VP: week' : 'VP: prior day';
       await fetchVolProfile();
+    });
+  }
+
+  // ── Clean / Analysis mode toggle ──────────────────────────────────────
+  const vmBtn = document.getElementById('view_mode');
+  if (vmBtn) {
+    const paint = () => {
+      vmBtn.textContent = state.analysis_mode ? '🔬 Analysis' : '🧭 Clean';
+      vmBtn.classList.toggle('btn-active', state.analysis_mode);
+    };
+    paint();
+    vmBtn.addEventListener('click', () => {
+      state.analysis_mode = !state.analysis_mode;
+      localStorage.setItem('hawala_analysis_mode', state.analysis_mode ? '1' : '0');
+      paint();
+      state.dirty = true;   // redraw to add/remove experimental overlays
     });
   }
 
@@ -624,7 +645,9 @@ function redrawAll () {
   const absDeltas = deltas.map(Math.abs).sort((a,b)=>a-b);
   const p70Delta  = absDeltas[Math.floor(absDeltas.length*0.70)] || 0;
 
-  for (let i = 0; i < sortedC.length; i++) {
+  // Experimental badges only in Analysis mode (kept off the disciplined
+  // Clean cockpit). Computations above stay so the entry-scorer can reuse them.
+  for (let i = 0; state.analysis_mode && i < sortedC.length; i++) {
     const c = sortedC[i];
     const body = Math.abs(c.close - c.open);
     const d    = c.delta_qty || 0;
@@ -748,6 +771,9 @@ function redrawAll () {
           line:{color:'rgba(123,31,162,0.5)', width:0.8, dash:'dot'}});
       }
     });
+    // ↓↓↓ Experimental / detail overlays — Analysis mode only. ↓↓↓
+    // (POC + value-area band above stay in Clean mode as key levels.)
+    if (state.analysis_mode) {
     // Naked POCs — prior-day POCs today's price hasn't traded back through.
     // A POC is "naked" if it's OUTSIDE the current visible candle range
     // extremes seen so far today (proxy: not between today's hi/lo).
@@ -793,6 +819,7 @@ function redrawAll () {
                 + `thin volume, price slices through fast (no support here)`,
       });
     });
+    }  // end if (state.analysis_mode) — experimental VP overlays
   }
 
   // ── High-probability entry markers (scored, multi-factor) ─────────────
@@ -812,7 +839,7 @@ function redrawAll () {
   // confluence + rejection wick, or value-edge + wick + significant delta)
   // — deliberately rare. Lower to 5 if you want more candidates.
   const ENTRY_MIN = 6;
-  if (state.vol_profile && candles.length >= 3) {
+  if (state.analysis_mode && state.vol_profile && candles.length >= 3) {
     const vp2  = state.vol_profile;
     const piv  = (state.pivots && state.pivots.pivots) || {};
     const lastClose = candles[candles.length - 1].close;
