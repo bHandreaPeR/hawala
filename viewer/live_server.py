@@ -23,8 +23,10 @@ import csv
 import json
 import logging
 import pathlib
+import pickle
 import time
-from datetime import date, datetime, time as dtime
+from collections import defaultdict
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -387,6 +389,142 @@ def _build_dom_profile(inst: str, day: str, cell_size: float,
             'ask_persistence':  float(r['ask_persistence']),
         })
     return {'cells': cells, 'n_snapshots': n_snaps}
+
+
+# ─── Composite Volume Profile (prior-day / weekly) from 1m candle history ────
+# Built from candles_1m_<INST>.pkl (gapless, ~6 months) rather than ticks
+# (which are sparse + holey). Each 1m bar's volume is distributed uniformly
+# across the price cells it spanned (low→high) — the standard OHLCV-profile
+# approximation. Calendar-aware: "prior day" skips weekends + holidays.
+def _prior_trading_days(n: int, before: Optional[date] = None) -> list:
+    """Return up to n trading days strictly BEFORE `before` (default today),
+    most-recent-last. Bounded scan."""
+    from ops.market_calendar import is_trading_day
+    before = before or date.today()
+    out, d, scanned = [], before - timedelta(days=1), 0
+    while len(out) < n and scanned < 40:
+        if is_trading_day(d):
+            out.append(d)
+        d -= timedelta(days=1); scanned += 1
+    return sorted(out)
+
+
+def _day_profile(sub: pd.DataFrame, cs: float) -> dict:
+    """volume-at-price for one slice of 1m bars. Returns {cell: volume}."""
+    prof: dict = defaultdict(float)
+    for _, b in sub.iterrows():
+        lo = float(b['low']); hi = float(b['high']); vol = float(b['volume'])
+        if hi <= 0 or vol <= 0:
+            continue
+        lo_c = round(lo / cs) * cs
+        hi_c = round(hi / cs) * cs
+        n_cells = max(1, int(round((hi_c - lo_c) / cs)) + 1)
+        v_each = vol / n_cells
+        c = lo_c
+        for _ in range(n_cells):
+            prof[round(c, 2)] += v_each
+            c += cs
+    return prof
+
+
+def _classify_profile(prof: dict, cs: float) -> dict:
+    """Given {cell: volume}, compute POC, value area (70%), HVN + LVN levels."""
+    if not prof:
+        return {'cells': [], 'poc': None, 'vah': None, 'val': None,
+                'hvn': [], 'lvn': []}
+    cells = sorted(prof.items())                       # [(price, vol), ...]
+    prices = [c for c, _ in cells]
+    vols   = [v for _, v in cells]
+    total  = sum(vols)
+    vmax   = max(vols)
+    poc_i  = vols.index(vmax)
+    poc    = prices[poc_i]
+
+    # Value area: expand outward from POC until ≥70% of total volume.
+    lo_i = hi_i = poc_i
+    acc = vols[poc_i]
+    while acc < 0.70 * total and (lo_i > 0 or hi_i < len(vols) - 1):
+        take_lo = vols[lo_i - 1] if lo_i > 0 else -1
+        take_hi = vols[hi_i + 1] if hi_i < len(vols) - 1 else -1
+        if take_hi >= take_lo:
+            hi_i += 1; acc += vols[hi_i]
+        else:
+            lo_i -= 1; acc += vols[lo_i]
+    val, vah = prices[lo_i], prices[hi_i]
+
+    # HVN = local peaks ≥ 70th percentile of volume.
+    # LVN = local troughs ≤ 25th percentile (rejection gaps).
+    import numpy as _np
+    p70 = float(_np.percentile(vols, 70))
+    p25 = float(_np.percentile(vols, 25))
+    hvn, lvn = [], []
+    for i in range(len(vols)):
+        left  = vols[i - 1] if i > 0 else -1
+        right = vols[i + 1] if i < len(vols) - 1 else -1
+        if vols[i] >= p70 and vols[i] >= left and vols[i] >= right:
+            hvn.append(prices[i])
+        if vols[i] <= p25 and vols[i] <= left and vols[i] <= right:
+            lvn.append(prices[i])
+
+    return {
+        'cells': [{'price': p, 'volume': round(v, 0),
+                   'pct': round(v / vmax, 3)} for p, v in cells],
+        'poc': poc, 'vah': vah, 'val': val,
+        'hvn': hvn, 'lvn': lvn,
+    }
+
+
+def _build_volume_profile(inst: str, scope: str, cell_size: float) -> dict:
+    path = CACHE_DIR / f'candles_1m_{inst}.pkl'
+    empty = {'inst': inst, 'scope': scope, 'cells': [], 'poc': None,
+             'vah': None, 'val': None, 'hvn': [], 'lvn': [],
+             'prior_pocs': [], 'days': []}
+    if not path.exists():
+        return empty
+    try:
+        df = pickle.load(open(path, 'rb'))
+    except Exception:
+        return empty
+    if df is None or df.empty:
+        return empty
+    df = df.copy()
+    df['d'] = pd.to_datetime(df['ts']).dt.date
+
+    n = 1 if scope == 'prior_day' else 5
+    days = _prior_trading_days(n)
+    sub = df[df['d'].isin(days)]
+    if sub.empty:
+        return empty
+
+    prof = _day_profile(sub, cell_size)
+    out  = _classify_profile(prof, cell_size)
+
+    # Per-day POCs (for naked-POC marking on the client). A POC is "naked"
+    # if today's price action hasn't traded back through it yet — the client
+    # decides that using the live price, we just hand over the candidates.
+    prior_pocs = []
+    for d in days:
+        dprof = _day_profile(df[df['d'] == d], cell_size)
+        if dprof:
+            dpoc = max(dprof.items(), key=lambda kv: kv[1])[0]
+            prior_pocs.append({'date': str(d), 'poc': dpoc})
+
+    out.update({'inst': inst, 'scope': scope,
+                'days': [str(d) for d in days],
+                'prior_pocs': prior_pocs})
+    return out
+
+
+@app.get('/volume_profile')
+async def volume_profile(inst: str = Query(...),
+                          scope: str = 'prior_day',
+                          cell: Optional[float] = None):
+    if inst not in INSTRUMENTS:
+        return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
+    if scope not in ('prior_day', 'week'):
+        scope = 'prior_day'
+    cs = float(cell) if cell else DEFAULT_CELL[inst]
+    return JSONResponse(_build_volume_profile(inst, scope, cs))
 
 
 @app.get('/dom_profile')

@@ -48,6 +48,8 @@ const state = {
   positioning: null,                         // unified positioning snapshot
   positioning_timer: null,
   pivots: null,                              // {pivots:{P,R1..3,S1..3}, prior_day:{...}}
+  vol_profile: null,                         // composite VPVR {cells, poc, vah, val, hvn, lvn, prior_pocs}
+  vp_scope: 'prior_day',                     // 'prior_day' | 'week'
   resync_timer: null,                       // periodic running-bucket resync
 };
 
@@ -99,6 +101,13 @@ async function bootstrap () {
   });
   document.getElementById('reload').addEventListener('click', fullReload);
 
+  // ── Volume-profile scope toggle ───────────────────────────────────────
+  document.getElementById('vp_scope').addEventListener('click', async (e) => {
+    state.vp_scope = state.vp_scope === 'prior_day' ? 'week' : 'prior_day';
+    e.target.textContent = state.vp_scope === 'week' ? 'VP: week' : 'VP: prior day';
+    await fetchVolProfile();
+  });
+
   // ── Zoom buttons ──────────────────────────────────────────────────────
   const stepZoom = (axis, dir) => {
     const cur = axis === 'x' ? state.zoom_x : state.zoom_y;
@@ -135,6 +144,16 @@ async function bootstrap () {
 
   await fullReload();
   startRedrawLoop();
+}
+
+async function fetchVolProfile () {
+  try {
+    const q = new URLSearchParams({inst: state.inst, scope: state.vp_scope,
+                                   cell: state.cell_size});
+    const r = await fetch('/volume_profile?' + q).then(r => r.json());
+    state.vol_profile = (r && !r.error) ? r : null;
+  } catch (e) { state.vol_profile = null; }
+  state.dirty = true;
 }
 
 function updateZoomLabels () {
@@ -182,6 +201,9 @@ async function fullReload () {
     const pr = await fetch('/pivots?' + pq).then(r => r.json());
     state.pivots = (pr && !pr.error) ? pr : null;
   } catch (e) { state.pivots = null; }
+  // Composite volume profile (prior-day / weekly) — stable for the session,
+  // fetch once on reload. Re-fetched when the user toggles scope.
+  await fetchVolProfile();
   redrawAll();
   setStatus('live ✓');
   openWS();
@@ -571,6 +593,51 @@ function redrawAll () {
       fillcolor:'rgba(0,0,0,0)', line:{width:1.5, color:'#fdd835'}});
   }
 
+  // ── Absorption + reversal badges ───────────────────────────────────────
+  // Absorption: large |delta| but the candle barely moved (passive orders
+  //   soaked up the aggression). High conviction one-sided flow that FAILED
+  //   to move price = the level is being defended. Marker: 🅐 above the bar.
+  // Reversal: delta sign flips vs the prior bar AT a local extreme (the high
+  //   of an up-run or low of a down-run). Marker: ⤣ arrow at the turn.
+  // Both computed from data already in the snapshot — no new capture.
+  const sortedC = candles;   // already bucket-sorted
+  const bodies  = sortedC.map(c => Math.abs(c.close - c.open));
+  const medBody = bodies.slice().sort((a,b)=>a-b)[Math.floor(bodies.length/2)] || cs;
+  const deltas  = sortedC.map(c => c.delta_qty || 0);
+  const absDeltas = deltas.map(Math.abs).sort((a,b)=>a-b);
+  const p70Delta  = absDeltas[Math.floor(absDeltas.length*0.70)] || 0;
+
+  for (let i = 0; i < sortedC.length; i++) {
+    const c = sortedC[i];
+    const body = Math.abs(c.close - c.open);
+    const d    = c.delta_qty || 0;
+    // Absorption: delta in top-30% of the session AND body ≤ 60% of median.
+    if (Math.abs(d) >= p70Delta && p70Delta > 0 && body <= 0.6 * medBody) {
+      annos.push({
+        x: c.bucket, y: c.high + 1.2*cs, xref:'x', yref:'y',
+        text:'🅐', showarrow:false, font:{size:12},
+        hovertext:`Absorption — Δ=${fmtNum(d)} but body only ${body.toFixed(1)}pts. `
+                + `Aggression absorbed; level defended.`,
+      });
+    }
+    // Reversal: delta flips sign vs prior bar, at a local extreme.
+    if (i > 0) {
+      const prev = deltas[i-1];
+      const flip = (prev > 0 && d < 0) || (prev < 0 && d > 0);
+      const isHi = i>0 && i<sortedC.length-1 && c.high >= sortedC[i-1].high && c.high >= sortedC[i+1]?.high;
+      const isLo = i>0 && i<sortedC.length-1 && c.low  <= sortedC[i-1].low  && c.low  <= sortedC[i+1]?.low;
+      if (flip && (isHi || isLo)) {
+        annos.push({
+          x: c.bucket, y: isHi ? c.high + 1.2*cs : c.low - 1.2*cs,
+          xref:'x', yref:'y', text: isHi ? '⤵' : '⤴',
+          showarrow:false, font:{size:13, color: isHi ? '#ef5350' : '#26a69a'},
+          hovertext:`Delta-flip reversal at local ${isHi?'high':'low'} `
+                  + `(Δ ${fmtNum(prev)}→${fmtNum(d)})`,
+        });
+      }
+    }
+  }
+
   // ── Visible window (data-driven, no synthetic padding) ─────────────────
   // x: at zoom 1.0 show every actual candle (no pre-09:15 blanks). Zoom > 1
   // narrows to the most recent slice. Clamped so we always see ≥6 candles.
@@ -621,6 +688,79 @@ function redrawAll () {
         font:{size:9, color:L.color}, borderpad:2,
       });
     }
+  }
+
+  // ── Composite Volume Profile overlay (prior-day / weekly) ──────────────
+  // Drawn as: translucent value-area band, bold POC line, naked-POC magnet
+  // lines, and HVN/LVN markers in the left margin. These are the *completed
+  // prior session(s)* levels — actionable from the open, unlike today's
+  // still-forming profile.
+  if (state.vol_profile && state.vol_profile.cells && state.vol_profile.cells.length) {
+    const vp = state.vol_profile;
+    const scopeLbl = vp.scope === 'week' ? 'wk' : 'pd';
+    const inView = (y) => y >= yRange[0] - cs && y <= yRange[1] + cs;
+
+    // Value-area band (translucent purple) between VAL and VAH
+    if (vp.val != null && vp.vah != null) {
+      shapes.push({
+        type:'rect', xref:'x', yref:'y', layer:'below',
+        x0: xRange[0], x1: xRange[1], y0: vp.val, y1: vp.vah,
+        fillcolor:'rgba(123,31,162,0.07)', line:{width:0},
+      });
+    }
+    // POC — bold purple line
+    if (vp.poc != null && inView(vp.poc)) {
+      shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
+        x0:xRange[0], x1:xRange[1], y0:vp.poc, y1:vp.poc,
+        line:{color:'#7b1fa2', width:1.8}});
+      annos.push({x:xRange[0], y:vp.poc, xref:'x', yref:'y',
+        text:`<b>POC·${scopeLbl}</b> ${vp.poc.toFixed(0)}`,
+        showarrow:false, xanchor:'left', yanchor:'bottom',
+        bgcolor:'rgba(255,255,255,0.85)', bordercolor:'#7b1fa2', borderwidth:1,
+        font:{size:9, color:'#7b1fa2'}, borderpad:2});
+    }
+    // VAH / VAL dashed bounds
+    [['VAH', vp.vah], ['VAL', vp.val]].forEach(([lbl, y]) => {
+      if (y != null && inView(y)) {
+        shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
+          x0:xRange[0], x1:xRange[1], y0:y, y1:y,
+          line:{color:'rgba(123,31,162,0.5)', width:0.8, dash:'dot'}});
+      }
+    });
+    // Naked POCs — prior-day POCs today's price hasn't traded back through.
+    // A POC is "naked" if it's OUTSIDE the current visible candle range
+    // extremes seen so far today (proxy: not between today's hi/lo).
+    const todayHi = Math.max(...candles.map(c => c.high));
+    const todayLo = Math.min(...candles.map(c => c.low));
+    (vp.prior_pocs || []).forEach(pp => {
+      const naked = pp.poc > todayHi || pp.poc < todayLo;
+      if (naked && inView(pp.poc)) {
+        shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
+          x0:xRange[0], x1:xRange[1], y0:pp.poc, y1:pp.poc,
+          line:{color:'#ff6f00', width:1.2, dash:'dash'}});
+        annos.push({x:xRange[1], y:pp.poc, xref:'x', yref:'y',
+          text:`nPOC ${pp.date.slice(5)}`,
+          showarrow:false, xanchor:'right', yanchor:'bottom',
+          bgcolor:'rgba(255,255,255,0.8)', bordercolor:'#ff6f00', borderwidth:1,
+          font:{size:8, color:'#ff6f00'}, borderpad:1});
+      }
+    });
+    // HVN markers (acceptance walls) — left-margin purple ▸; LVN (rejection
+    // gaps) — left-margin hollow ▹. Drawn as annotations just inside the axis.
+    (vp.hvn || []).forEach(y => {
+      if (inView(y)) annos.push({
+        x: xRange[0], y, xref:'x', yref:'y', xanchor:'left', yanchor:'middle',
+        text:'▸', showarrow:false, font:{size:11, color:'#7b1fa2'},
+        hovertext:`HVN ${y.toFixed(0)} — acceptance wall (hard to break)`,
+      });
+    });
+    (vp.lvn || []).forEach(y => {
+      if (inView(y)) annos.push({
+        x: xRange[0], y, xref:'x', yref:'y', xanchor:'left', yanchor:'middle',
+        text:'▹', showarrow:false, font:{size:11, color:'#bbb'},
+        hovertext:`LVN ${y.toFixed(0)} — rejection gap (price slices through)`,
+      });
+    });
   }
 
   // y-tick density: aim for ~10 labels regardless of cell size / zoom.
