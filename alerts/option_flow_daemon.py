@@ -96,6 +96,12 @@ INSTRUMENTS = {
                   'strike_step': 50,  'atm_band_strikes': 20},
     'BANKNIFTY': {'exchange': 'NSE',  'underlying': 'BANKNIFTY', 'lot_size': 30,
                   'strike_step': 100, 'atm_band_strikes': 15},
+    # SENSEX added 2026-05-29 — BSE option chain (get_option_chain
+    # exchange='BSE' underlying='SENSEX' verified working). Lot 20, strikes
+    # 100 apart. Per-inst try/except in oneshot isolates any BSE quirk so it
+    # can't disturb NIFTY/BANKNIFTY capture.
+    'SENSEX':    {'exchange': 'BSE',  'underlying': 'SENSEX',    'lot_size': 20,
+                  'strike_step': 100, 'atm_band_strikes': 15},
 }
 
 log = logging.getLogger('option_flow_daemon')
