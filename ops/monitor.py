@@ -279,7 +279,9 @@ def _build_targets() -> list[Target]:
                      or (lambda a: a is not None and a < 120)(_tick_csv_age('NIFTY')))),
             why_unhealthy=lambda: (
                 'process dead' if _process_running(r'alerts\.tick_recorder$') is None
-                else f'NIFTY ticks stale ({_tick_csv_age("NIFTY"):.0f}s)'),
+                else (lambda a: f'NIFTY ticks stale ({a:.0f}s)' if a is not None
+                      else 'NIFTY tick CSV empty/missing (no rows written)')(
+                          _tick_csv_age('NIFTY'))),
             restart_cmd=restart('alerts.tick_recorder'),
         ),
         # viewer — HTTP endpoint must respond
@@ -379,7 +381,15 @@ def _check_one(t: Target, state: TargetState, dry_run: bool) -> None:
     if time.time() - state.last_restart_ts < t.grace_period_s:
         return
 
-    reason = t.why_unhealthy()
+    # why_unhealthy() may raise (e.g. f-string formatting None) — don't let
+    # that abort the restart logic. Today (2026-05-28) the tick_recorder
+    # wedged for 6 hours because _tick_csv_age returned None on a
+    # header-only CSV, the f-string in its why_unhealthy raised TypeError,
+    # the outer try/except caught it, and no restart ever fired.
+    try:
+        reason = t.why_unhealthy()
+    except Exception as e:
+        reason = f'unhealthy (why_unhealthy raised: {e})'
     log.warning('UNHEALTHY %s — %s', t.name, reason)
 
     # Already escalated? do not auto-restart
