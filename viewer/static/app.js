@@ -34,6 +34,8 @@ const _stored = (k, d) => {
 const state = {
   cfg: null, inst: null, tf: '5min', cell_size: 5, date: null,
   paused: false, autoscroll: true,
+  view_rev: 0,        // bumps when a button forces a programmatic view change
+  force_range: false, // one-shot: apply computed range on the next redraw
   zoom_x: _stored('hawala_zoom_x', 1.0),
   zoom_y: _stored('hawala_zoom_y', 1.0),
   snap: null,
@@ -98,6 +100,11 @@ async function bootstrap () {
   document.getElementById('autoscroll').addEventListener('click', e => {
     state.autoscroll = !state.autoscroll;
     e.target.classList.toggle('btn-active', state.autoscroll);
+    // Re-entering follow mode is a programmatic view change — force the
+    // computed range to apply on the next redraw, overriding any manual
+    // zoom/pan the user had done.
+    if (state.autoscroll) { state.view_rev++; state.force_range = true; }
+    state.dirty = true;
   });
   document.getElementById('reload').addEventListener('click', fullReload);
 
@@ -122,7 +129,9 @@ async function bootstrap () {
     if (axis === 'x') state.zoom_x = nv; else state.zoom_y = nv;
     localStorage.setItem(`hawala_zoom_${axis}`, String(nv));
     updateZoomLabels();
-    state.dirty = true;     // trigger redraw
+    // Zoom buttons are programmatic view changes — force the computed range
+    // to apply even if the user had manually dragged the chart.
+    state.view_rev++; state.force_range = true; state.dirty = true;
   };
   document.getElementById('zoom_x_in' ).addEventListener('click', () => stepZoom('x',  1));
   document.getElementById('zoom_x_out').addEventListener('click', () => stepZoom('x', -1));
@@ -132,8 +141,12 @@ async function bootstrap () {
     state.zoom_x = state.zoom_y = 1.0;
     localStorage.setItem('hawala_zoom_x', '1');
     localStorage.setItem('hawala_zoom_y', '1');
+    // Reset also re-enters follow mode so the view snaps back to "live, full".
+    state.autoscroll = true;
+    const asBtn = document.getElementById('autoscroll');
+    if (asBtn) asBtn.classList.add('btn-active');
     updateZoomLabels();
-    state.dirty = true;
+    state.view_rev++; state.force_range = true; state.dirty = true;
   });
   // Keyboard shortcuts: +/- = price zoom, [/] = time zoom, 0 = reset
   document.addEventListener('keydown', e => {
@@ -862,17 +875,33 @@ function redrawAll () {
   let xLabelStride = X_TICK_LABEL_EVERY[state.tf] || 1;
   if (visCandles <= 20) xLabelStride = 1;
 
+  // ── Range + uirevision: make manual zoom/pan STICK ────────────────────
+  // Plotly preserves user zoom/pan across redraws iff `uirevision` is
+  // unchanged. We only force our computed range when in follow mode OR a
+  // button just demanded it (force_range one-shot). Otherwise the user's
+  // drag-zoom ("snip") and horizontal scroll persist through the 200ms /
+  // 5s redraws instead of being wiped.
+  const applyRange = state.autoscroll || state.force_range;
+  state.force_range = false;
+  const viewKey = `${state.inst}|${state.tf}|${state.date}|${state.cell_size}`;
+  // In follow mode, advancing lastBk bumps the revision so the range tracks
+  // new candles. In manual mode, only a button (view_rev) changes it, so
+  // native interaction sticks between button presses.
+  const uirev = state.autoscroll
+    ? `${viewKey}|follow|${state.view_rev}|${lastBk}`
+    : `${viewKey}|manual|${state.view_rev}`;
+  const xRangeOpt = applyRange ? {range: xRange} : {};
+  const yRangeOpt = applyRange ? {range: yRange} : {};
+
   const layout = {
     paper_bgcolor:'#fafafa', plot_bgcolor:'#fff',
     margin:{l:55, r:15, t:25, b:42},
     showlegend:false,
     // domains: main=72%, session profile=12%, live DOM=14% (right edge).
-    // Delta-pane (xaxis3) shares the [0, 0.72] domain → time stamps line up
-    // vertically with the candles directly above.
-    xaxis:  {type:'date', domain:[0, 0.72], range:xRange,
+    xaxis:  {type:'date', domain:[0, 0.72], ...xRangeOpt,
              dtick: tf_ms * xLabelStride, tickformat:'%H:%M', tick0: lastBk,
              gridcolor:'#eef0f2', gridwidth:1, showspikes:false},
-    yaxis:  {domain:[0.27, 1], title:'price', side:'left', range:yRange,
+    yaxis:  {domain:[0.27, 1], title:'price', side:'left', ...yRangeOpt,
              dtick: yDtick, tickformat:',d',
              gridcolor:'#eef0f2', gridwidth:1},
     // Session BS-summary pane — show qty labels at bottom so user knows scale
@@ -880,11 +909,12 @@ function redrawAll () {
              showticklabels:true, tickfont:{size:9}, nticks:3,
              gridcolor:'#eef0f2'},
     yaxis2: {domain:[0.27, 1], matches:'y', showticklabels:false},
-    // Delta pane — SAME x-domain + range + dtick as the candle pane so
-    // timestamps line up pixel-perfect underneath each candle.
-    xaxis3: {type:'date', domain:[0, 0.72], range:xRange, anchor:'y3',
-             dtick: tf_ms * xLabelStride, tickformat:'%H:%M', tick0: lastBk,
-             gridcolor:'#eef0f2', showticklabels:true, tickfont:{size:9}},
+    // Delta pane — matches:'x' so it ALWAYS mirrors the candle pane's
+    // zoom/pan (timestamps stay aligned, and panning the candles scrolls
+    // the delta histogram in lockstep — no separate range to fight).
+    xaxis3: {type:'date', domain:[0, 0.72], anchor:'y3', matches:'x',
+             tickformat:'%H:%M', gridcolor:'#eef0f2',
+             showticklabels:true, tickfont:{size:9}},
     yaxis3: {domain:[0, 0.22], title:'Δ qty', gridcolor:'#eef0f2',
              tickfont:{size:9}, nticks:4},
     // Live DOM + session profile pane — show qty labels
@@ -895,7 +925,7 @@ function redrawAll () {
     yaxis4: {domain:[0.27, 1], matches:'y', showticklabels:false},
     shapes, annotations: annos,
     barmode:'overlay',
-    uirevision: state.autoscroll ? undefined : 'pin',  // preserves zoom unless autoscroll
+    uirevision: uirev,
   };
 
   const traces = [
@@ -976,7 +1006,27 @@ function redrawAll () {
      hovertemplate:'LIVE ASK %{y}<br>qty=%{x:.0f}<extra></extra>'},
   ];
 
-  Plotly.react('chart', traces, layout, {responsive:true, displaylogo:false});
+  Plotly.react('chart', traces, layout,
+               {responsive:true, displaylogo:false, scrollZoom:true});
+
+  // Wire the user-interaction listener ONCE (persists across Plotly.react).
+  // When the user box-zooms ("snip") or pans the x-axis, drop out of follow
+  // mode so their view sticks instead of being re-applied on the next redraw.
+  if (!state._relayout_wired) {
+    const chartDiv = document.getElementById('chart');
+    if (chartDiv && chartDiv.on) {
+      chartDiv.on('plotly_relayout', (ev) => {
+        const touched = Object.keys(ev || {}).some(k =>
+          k.startsWith('xaxis.range') || k.startsWith('yaxis.range'));
+        if (touched && state.autoscroll) {
+          state.autoscroll = false;
+          const b = document.getElementById('autoscroll');
+          if (b) b.classList.remove('btn-active');
+        }
+      });
+      state._relayout_wired = true;
+    }
+  }
 
   document.getElementById('meta').textContent =
     `${candles.length} candles · ${cells.length} cells · tf=${state.tf} cell=${state.cell_size}`;
