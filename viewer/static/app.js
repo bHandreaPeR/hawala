@@ -762,8 +762,8 @@ function redrawAll () {
           font:{size:8, color:'#ff6f00'}, borderpad:1});
       }
     });
-    // HVN markers (acceptance walls) — left-margin purple ▸; LVN (rejection
-    // gaps) — left-margin hollow ▹. Drawn as annotations just inside the axis.
+    // HVN markers (acceptance walls) — left-margin purple ▸ (now capped to
+    // top 6 server-side, so no clutter).
     (vp.hvn || []).forEach(y => {
       if (inView(y)) annos.push({
         x: xRange[0], y, xref:'x', yref:'y', xanchor:'left', yanchor:'middle',
@@ -771,13 +771,78 @@ function redrawAll () {
         hovertext:`HVN ${y.toFixed(0)} — acceptance wall (hard to break)`,
       });
     });
-    (vp.lvn || []).forEach(y => {
-      if (inView(y)) annos.push({
-        x: xRange[0], y, xref:'x', yref:'y', xanchor:'left', yanchor:'middle',
-        text:'▹', showarrow:false, font:{size:11, color:'#bbb'},
-        hovertext:`LVN ${y.toFixed(0)} — rejection gap (price slices through)`,
+    // LVN gap ZONES — shaded grey rectangles (rejection vacuums where price
+    // slices through fast). Clustered server-side into ≤3 zones, not spam.
+    (vp.lvn_zones || []).forEach(z => {
+      if (z.hi < yRange[0] || z.lo > yRange[1]) return;
+      shapes.push({
+        type:'rect', xref:'x', yref:'y', layer:'below',
+        x0:xRange[0], x1:xRange[1], y0:z.lo, y1:z.hi,
+        fillcolor:'rgba(120,120,120,0.10)',
+        line:{width:0.5, color:'rgba(120,120,120,0.4)', dash:'dot'},
+      });
+      annos.push({
+        x: xRange[0], y: (z.lo + z.hi) / 2, xref:'x', yref:'y',
+        xanchor:'left', yanchor:'middle', text:'▹ gap',
+        showarrow:false, font:{size:8, color:'#999'},
+        hovertext:`LVN vacuum ${z.lo.toFixed(0)}-${z.hi.toFixed(0)} — `
+                + `thin volume, price slices through fast (no support here)`,
       });
     });
+  }
+
+  // ── Bounce / rejection / entry markers ─────────────────────────────────
+  // Ties the level map to order-flow behaviour. For each candle, check if it
+  // INTERACTED with a significant level (POC / VAH / VAL / HVN / pivot) — i.e.
+  // its wick pierced the level but it closed back on the origin side — AND the
+  // bar's delta confirms the rejection. That's a bounce / possible entry:
+  //   ▲ green = bullish reaction at support (wick below level, closed above,
+  //             buy delta) → long candidate
+  //   ▼ red   = bearish reaction at resistance (wick above level, closed
+  //             below, sell delta) → short candidate
+  // Deliberately conservative so the chart shows a FEW high-quality marks,
+  // not noise.
+  if (state.vol_profile || state.pivots) {
+    // Assemble the significant levels once.
+    const sig = [];
+    const vp2 = state.vol_profile;
+    if (vp2) {
+      if (vp2.poc != null) sig.push({px: vp2.poc, name: 'POC'});
+      if (vp2.vah != null) sig.push({px: vp2.vah, name: 'VAH'});
+      if (vp2.val != null) sig.push({px: vp2.val, name: 'VAL'});
+      (vp2.hvn || []).forEach(h => sig.push({px: h, name: 'HVN'}));
+    }
+    if (state.pivots && state.pivots.pivots) {
+      const P = state.pivots.pivots;
+      ['R1','P','S1'].forEach(k => sig.push({px: P[k], name: k}));
+    }
+    const tol = cs * 1.0;   // "touch" tolerance = 1 cell
+    for (const c of candles) {
+      const d = c.delta_qty || 0;
+      for (const L of sig) {
+        if (L.px == null) continue;
+        // Bullish: low wicked at/below level, close finished above it, buy delta
+        const bullReact = c.low <= L.px + tol && c.close > L.px && d > 0
+                          && c.close >= c.open;
+        // Bearish: high wicked at/above level, close finished below it, sell delta
+        const bearReact = c.high >= L.px - tol && c.close < L.px && d < 0
+                          && c.close <= c.open;
+        if (bullReact) {
+          annos.push({x:c.bucket, y:c.low - 1.4*cs, xref:'x', yref:'y',
+            text:'▲', showarrow:false, font:{size:12, color:'#26a69a'},
+            hovertext:`Bullish reaction at ${L.name} ${L.px.toFixed(0)} — `
+                    + `wick rejected, closed above, +delta ${fmtNum(d)}. Long candidate.`});
+          break;   // one marker per candle
+        }
+        if (bearReact) {
+          annos.push({x:c.bucket, y:c.high + 1.4*cs, xref:'x', yref:'y',
+            text:'▼', showarrow:false, font:{size:12, color:'#ef5350'},
+            hovertext:`Bearish reaction at ${L.name} ${L.px.toFixed(0)} — `
+                    + `wick rejected, closed below, -delta ${fmtNum(d)}. Short candidate.`});
+          break;
+        }
+      }
+    }
   }
 
   // y-tick density: aim for ~10 labels regardless of cell size / zoom.

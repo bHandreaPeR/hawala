@@ -461,25 +461,48 @@ def _classify_profile(prof: dict, cs: float) -> dict:
             lo_i -= 1; acc += vols[lo_i]
     val, vah = prices[lo_i], prices[hi_i]
 
-    # HVN = local peaks ≥ 70th percentile of volume.
-    # LVN = local troughs ≤ 25th percentile (rejection gaps).
+    # ── De-noised HVN + LVN ──────────────────────────────────────────────
+    # HVN = local peaks ≥ 80th percentile, but capped to the TOP 6 by volume
+    # so we surface only the walls that matter (not 19 ticks of micro-noise).
+    # LVN = low-volume cells (≤ 20th pctile) CLUSTERED into gap ZONES rather
+    # than dozens of individual prices — a 30-cell rejection vacuum is ONE
+    # zone, not 30 levels. Returns lvn_zones [{lo, hi}], top 3 by width.
     import numpy as _np
-    p70 = float(_np.percentile(vols, 70))
-    p25 = float(_np.percentile(vols, 25))
-    hvn, lvn = [], []
+    p80 = float(_np.percentile(vols, 80))
+    p20 = float(_np.percentile(vols, 20))
+
+    hvn_cand = []
     for i in range(len(vols)):
         left  = vols[i - 1] if i > 0 else -1
         right = vols[i + 1] if i < len(vols) - 1 else -1
-        if vols[i] >= p70 and vols[i] >= left and vols[i] >= right:
-            hvn.append(prices[i])
-        if vols[i] <= p25 and vols[i] <= left and vols[i] <= right:
-            lvn.append(prices[i])
+        if vols[i] >= p80 and vols[i] >= left and vols[i] >= right:
+            hvn_cand.append((prices[i], vols[i]))
+    hvn_cand.sort(key=lambda pv: -pv[1])
+    hvn = sorted(p for p, _ in hvn_cand[:6])
+
+    # Cluster consecutive low-volume cells into gap zones.
+    cs2 = cs * 1.5   # cells within 1.5×cell count as contiguous
+    low_prices = [prices[i] for i in range(len(vols)) if vols[i] <= p20]
+    lvn_zones = []
+    if low_prices:
+        zlo = zhi = low_prices[0]
+        for p in low_prices[1:]:
+            if p - zhi <= cs2:
+                zhi = p
+            else:
+                lvn_zones.append({'lo': zlo, 'hi': zhi})
+                zlo = zhi = p
+        lvn_zones.append({'lo': zlo, 'hi': zhi})
+    # Keep only the widest 3 zones (≥ 2 cells wide) — the real vacuums.
+    lvn_zones = [z for z in lvn_zones if (z['hi'] - z['lo']) >= cs]
+    lvn_zones.sort(key=lambda z: -(z['hi'] - z['lo']))
+    lvn_zones = lvn_zones[:3]
 
     return {
         'cells': [{'price': p, 'volume': round(v, 0),
                    'pct': round(v / vmax, 3)} for p, v in cells],
         'poc': poc, 'vah': vah, 'val': val,
-        'hvn': hvn, 'lvn': lvn,
+        'hvn': hvn, 'lvn': [], 'lvn_zones': lvn_zones,
     }
 
 
