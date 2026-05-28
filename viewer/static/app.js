@@ -661,9 +661,13 @@ function redrawAll () {
   const lastBk  = candles[candles.length-1].bucket;
   const firstBk = candles[0].bucket;
   const visCandles = Math.max(6, Math.round(candles.length / state.zoom_x));
-  const startBk = state.autoscroll
-    ? Math.max(firstBk, lastBk - (visCandles - 1) * tf_ms)
-    : firstBk;
+  // Always derive the window from zoom_x (don't gate on autoscroll). If we
+  // gated it, the ⇤⇥ toolbar zoom buttons would silently do nothing once the
+  // user had manually interacted (which auto-disables autoscroll). At
+  // zoom_x=1 visCandles == candles.length so startBk == firstBk (full range).
+  // The window is only *applied* to the axis when applyRange is true (follow
+  // mode or a button's force_range); native drag/pan is preserved otherwise.
+  const startBk = Math.max(firstBk, lastBk - (visCandles - 1) * tf_ms);
   const xRange = [startBk - tf_ms * 0.5, lastBk + tf_ms * 0.5];
 
   // y: auto-fit to visible candles' highs/lows. Zoom_y contracts that span
