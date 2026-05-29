@@ -994,17 +994,48 @@ function redrawAll () {
                 + `(≤60% of median ${medRange.toFixed(1)}). Aggression absorbed; price pinned.`,
       });
     }
-    // Reversal: delta flips sign vs prior bar, at a local extreme.
+    // ── REJECTION (pin-bar): one wick ≥ 60% of the bar's range — price probed
+    //    a level and was pushed back. Upper wick = highs rejected (bearish);
+    //    lower wick = lows rejected (bullish). ──
+    const upWick = c.high - Math.max(c.open, c.close);
+    const dnWick = Math.min(c.open, c.close) - c.low;
+    // Require a SUBSTANTIVE bar (range ≥ half the median) so a 100%-wick on a
+    // tiny doji doesn't spam the flag on quiet tape.
+    const bigEnough = rng >= 0.5 * medRange;
+    if (bigEnough && upWick >= 0.60 * rng) {
+      annos.push({
+        x:c.bucket, y:c.high + 1.5*cs, xref:'x', yref:'y',
+        text:'REJECTION ⤓', showarrow:false, xanchor:'center', yanchor:'bottom',
+        font:{size:9, color:'#fff'}, bgcolor:'rgba(239,83,80,0.82)', borderpad:2,
+        hovertext:`Rejection — upper wick ${upWick.toFixed(1)}pt `
+                + `(${(100*upWick/rng).toFixed(0)}% of range). Highs rejected (bearish).`,
+      });
+    } else if (bigEnough && dnWick >= 0.60 * rng) {
+      annos.push({
+        x:c.bucket, y:c.low - 1.5*cs, xref:'x', yref:'y',
+        text:'⤒ REJECTION', showarrow:false, xanchor:'center', yanchor:'top',
+        font:{size:9, color:'#fff'}, bgcolor:'rgba(38,166,154,0.82)', borderpad:2,
+        hovertext:`Rejection — lower wick ${dnWick.toFixed(1)}pt `
+                + `(${(100*dnWick/rng).toFixed(0)}% of range). Lows rejected (bullish).`,
+      });
+    }
+
+    // ── REVERSAL: delta flips sign vs the prior bar, AT a local extreme
+    //    (failed high / failed low with order-flow turning). ──
     if (i > 0) {
       const prev = deltas[i-1];
       const flip = (prev > 0 && d < 0) || (prev < 0 && d > 0);
-      const isHi = i>0 && i<sortedC.length-1 && c.high >= sortedC[i-1].high && c.high >= sortedC[i+1]?.high;
-      const isLo = i>0 && i<sortedC.length-1 && c.low  <= sortedC[i-1].low  && c.low  <= sortedC[i+1]?.low;
-      if (flip && (isHi || isLo)) {
+      const isHi = i<sortedC.length-1 && c.high >= sortedC[i-1].high && c.high >= sortedC[i+1]?.high;
+      const isLo = i<sortedC.length-1 && c.low  <= sortedC[i-1].low  && c.low  <= sortedC[i+1]?.low;
+      // Require the NEW bar's flow to be significant (≥ session p70) so a flip
+      // into near-zero delta doesn't count as a reversal.
+      if (flip && (isHi || isLo) && Math.abs(d) >= p70Delta && p70Delta > 0) {
         annos.push({
-          x: c.bucket, y: isHi ? c.high + 1.2*cs : c.low - 1.2*cs,
-          xref:'x', yref:'y', text: isHi ? '⤵' : '⤴',
-          showarrow:false, font:{size:13, color: isHi ? '#ef5350' : '#26a69a'},
+          x: c.bucket, y: isHi ? c.high + 3.0*cs : c.low - 3.0*cs,
+          xref:'x', yref:'y', text: isHi ? 'REVERSAL ⤵' : 'REVERSAL ⤴',
+          showarrow:false, xanchor:'center', yanchor: isHi ? 'bottom' : 'top',
+          font:{size:9, color:'#fff'},
+          bgcolor: isHi ? 'rgba(239,83,80,0.88)' : 'rgba(38,166,154,0.88)', borderpad:2,
           hovertext:`Delta-flip reversal at local ${isHi?'high':'low'} `
                   + `(Δ ${fmtNum(prev)}→${fmtNum(d)})`,
         });
