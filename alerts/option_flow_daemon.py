@@ -336,28 +336,67 @@ def _telegram_macro() -> tuple[str, list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Expiry resolution
 # ─────────────────────────────────────────────────────────────────────────────
+def _chain_has_atm_oi(strikes: dict, spot: float) -> bool:
+    """True if a strike within ~2% of spot carries nonzero CE/PE OI — i.e. a
+    real, ACTIVE expiry (distinguishes the live weekly from an empty date)."""
+    if not strikes or spot <= 0:
+        return False
+    band = 0.02 * spot
+    for k, sides in strikes.items():
+        try:
+            if abs(float(k) - spot) > band:
+                continue
+        except (TypeError, ValueError):
+            continue
+        for s in ('CE', 'PE'):
+            oi = (sides.get(s) or {}).get('open_interest', 0) or 0
+            try:
+                if float(oi) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
 def _resolve_weekly_expiry(g, exchange: str, underlying: str) -> str:
-    """Pick the nearest weekly expiry on or after today.
-    Note: Groww API uses kwarg `underlying_symbol` (not `underlying`)
-    and no longer accepts `segment` (May 2026 SDK change)."""
+    """Nearest TRADEABLE expiry on/after today.
+
+    get_expiries has been observed returning a stale, MONTHLY-only list (e.g.
+    nearest = month-end) that MISSES the active weekly the market trades. Since
+    get_option_chain accepts any expiry_date directly, we build candidate dates
+    (get_expiries results + the next ~10 weekdays) and return the SOONEST whose
+    chain is actually populated with near-the-money OI. Falls back to the
+    soonest candidate if none probe clean."""
     today = datetime.now(IST).date()
+    cands: set[str] = set()
     try:
-        r = _call_with_timeout(
-            g.get_expiries, EXPIRY_API_TIMEOUT_SEC,
-            exchange=exchange, underlying_symbol=underlying,
-        )
-        exps = sorted((r or {}).get('expiries', []) or [])
-        for e in exps:
+        r = _call_with_timeout(g.get_expiries, EXPIRY_API_TIMEOUT_SEC,
+                               exchange=exchange, underlying_symbol=underlying)
+        for e in (r or {}).get('expiries', []) or []:
             if e >= today.isoformat():
-                return e
-        return exps[-1] if exps else today.isoformat()
-    except TimeoutError:
-        log.warning("get_expiries TIMEOUT for %s after %ds",
-                    underlying, EXPIRY_API_TIMEOUT_SEC)
-        return today.isoformat()
+                cands.add(e)
     except Exception as e:
-        log.warning("get_expiries failed for %s: %s", underlying, e)
-        return today.isoformat()
+        log.warning("get_expiries failed for %s: %s (probing dates instead)", underlying, e)
+    # get_expiries can be stale → also probe the next 10 weekdays (expiries are
+    # weekdays) so we catch the active weekly it omits.
+    for i in range(1, 11):
+        d = today + timedelta(days=i)
+        if d.weekday() < 5:
+            cands.add(d.isoformat())
+    for e in sorted(cands):
+        try:
+            r = _call_with_timeout(g.get_option_chain, EXPIRY_API_TIMEOUT_SEC,
+                                   exchange=exchange, underlying=underlying,
+                                   expiry_date=e)
+        except Exception:
+            continue
+        if _chain_has_atm_oi((r or {}).get('strikes') or {},
+                             float((r or {}).get('underlying_ltp', 0) or 0)):
+            log.info("resolved nearest active expiry for %s: %s", underlying, e)
+            return e
+    fallback = sorted(cands)[0] if cands else today.isoformat()
+    log.warning("no populated chain probed for %s — falling back to %s", underlying, fallback)
+    return fallback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
