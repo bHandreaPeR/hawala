@@ -27,6 +27,7 @@ from pathlib import Path
 
 from . import dedup
 from . import dispatcher
+from . import sentiment as _sentiment
 from . import position_context as PC
 from . import scorer
 from .aggregator import aggregate_cluster, aggregate_global
@@ -98,6 +99,10 @@ def cycle_once() -> dict:
         s["url"] = it.get("url", "")
         if s["event_class"]:
             n_scored += 1
+            # Feed the rolling 24h MACRO sentiment log (separate from the
+            # 3-min alert pulse). Stamp the item's ts so decay is age-correct.
+            s["ts_seen"] = it.get("ts_seen")
+            _sentiment.record(s)
         ek, _is_new = dedup.assign_cluster(it["headline"])
         dedup.upsert_cluster(ek, s)
 
@@ -130,7 +135,10 @@ def cycle_once() -> dict:
                 c["event_key"] = c.get("event_key")
                 break
 
-    dispatcher.update_signal_file(global_agg)
+    # Rolling 24h sentiment for the viewer MACRO card (stable mood, recency-
+    # weighted). Written alongside the pulse; the alert path is untouched.
+    sentiment_agg = _sentiment.rolling(now)
+    dispatcher.update_signal_file(global_agg, sentiment=sentiment_agg)
 
     v3_state = PC.read_v3_state()
     sent = dispatcher.maybe_alert(global_agg, v3_state)

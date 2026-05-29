@@ -917,8 +917,11 @@ def _positioning_institutions(inst: str) -> dict:
 
 
 def _positioning_macro() -> dict:
-    """Read news_signal.json — score × confidence as magnitude.
-    Refresh cadence: news/runner.py writes this on each scoring cycle (minutes)."""
+    """Read news_signal.json. The MACRO card uses the ROLLING 24h SENTIMENT
+    (recency-weighted, ~6h half-life) when present — a stable mood gauge —
+    NOT the 3-min alert pulse (which whipsaws). Falls back to the pulse for
+    back-compat if the runner hasn't written sentiment yet.
+    Refresh cadence: news/runner.py writes this on each scoring cycle."""
     p = CACHE_DIR / 'news_signal.json'
     if not p.exists():
         return {'value': 0.0, 'dir': 0, 'label': 'no data', 'score': 0.0,
@@ -929,14 +932,22 @@ def _positioning_macro() -> dict:
     except Exception:
         return {'value': 0.0, 'dir': 0, 'label': 'err', 'score': 0.0,
                 'updated_ms': 0}
-    score = float(d.get('score', 0.0))
-    conf  = float(d.get('confidence', 0.0))
+    if 'sentiment_score' in d:                       # rolling 24h sentiment
+        score = float(d.get('sentiment_score', 0.0))
+        conf  = float(d.get('sentiment_confidence', 0.0))
+        basis = 'sentiment24h'
+    else:                                            # legacy pulse fallback
+        score = float(d.get('score', 0.0))
+        conf  = float(d.get('confidence', 0.0))
+        basis = 'pulse'
     val   = max(-1.0, min(1.0, score * conf))
     direction = 1 if val > 0.1 else (-1 if val < -0.1 else 0)
     label = 'bull' if direction == 1 else \
             ('bear' if direction == -1 else 'neutral')
     return {'value': round(val, 3), 'dir': direction, 'label': label,
             'score': round(score, 3), 'confidence': round(conf, 3),
+            'basis': basis, 'n': int(d.get('sentiment_n', 0)),
+            'window_h': d.get('sentiment_window_h'),
             'n_clusters': int(d.get('n_clusters', 0)),
             'updated_ms': updated_ms}
 

@@ -103,10 +103,11 @@ def _broadcast(token: str, chats: list[str], text: str) -> int:
 
 
 # ── Signal-file writer ───────────────────────────────────────────────────────
-def update_signal_file(global_agg: dict) -> None:
+def update_signal_file(global_agg: dict, sentiment: dict | None = None) -> None:
     SIGNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(IST)
     payload = {
+        # PULSE — 3-min half-life; drives alerts (kept as primary for back-compat).
         "score":         global_agg.get("score", 0.0),
         "confidence":    global_agg.get("confidence", 0.0),
         "n_clusters":    global_agg.get("n_clusters", 0),
@@ -115,6 +116,9 @@ def update_signal_file(global_agg: dict) -> None:
         "updated_at":    now.isoformat(),
         "stale_after":   (now + timedelta(minutes=90)).isoformat(),
     }
+    # SENTIMENT — rolling 24h, recency-weighted; drives the viewer MACRO card.
+    if sentiment:
+        payload.update(sentiment)
     tmp = SIGNAL_PATH.with_suffix(SIGNAL_PATH.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str))
     tmp.replace(SIGNAL_PATH)
