@@ -9,12 +9,19 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-name">Hawala</span>
-      <span id="spotbox" class="spotbox" title="Last price · daily % change">
-        <span id="spot_px" class="spot-px">—</span>
-        <span id="spot_chg" class="spot-chg">—</span>
-        <span id="spot_basis" class="spot-basis" title="Contango — futures minus spot index">—</span>
-      </span>
+      <div class="quotebox">
+        <div class="q-row">
+          <span class="q-label">INDEX</span>
+          <span id="spot_px" class="spot-px">—</span>
+          <span id="spot_chg" class="spot-chg">—</span>
+        </div>
+        <div class="q-row">
+          <span class="q-label q-fut">FUTURE</span>
+          <span id="fut_px" class="spot-px">—</span>
+          <span id="fut_chg" class="spot-chg">—</span>
+          <span id="spot_basis" class="spot-basis" title="Contango — futures minus spot index">—</span>
+        </div>
+      </div>
     </div>
     <div class="controls">
       <label>Symbol

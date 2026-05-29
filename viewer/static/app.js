@@ -257,12 +257,9 @@ function updateContango () {
 // zoom/pan/scroll). Hidden on replay or when the tip scrolls out of view.
 function pulseHeartbeat (price) {
   const hb = document.getElementById('heartbeat');
-  const tag = document.getElementById('hb_tag');
   if (!hb) return;
-  if (tag && price != null) {
-    tag.textContent = 'live ' + price.toLocaleString('en-IN', {maximumFractionDigits: 1});
-    if (state.tip) state.tip.y = price;   // tip follows the latest tick price
-  }
+  if (price != null && state.tip) state.tip.y = price;   // tip follows latest tick
+  if (price != null) updateSpotBox();                    // header FUTURE/INDEX live
   hb.classList.remove('stale', 'beat');
   void hb.offsetWidth;             // force reflow so the animation restarts
   hb.classList.add('beat');
@@ -289,9 +286,6 @@ function positionHeartbeat () {
     hb.style.left = (xa._offset + xa.l2p(x)) + 'px';
     hb.style.top  = (ya._offset + ya.l2p(y)) + 'px';
     hb.style.display = 'flex';
-    // Always show the live futures price at the tip (no hover required).
-    const tag = document.getElementById('hb_tag');
-    if (tag) tag.textContent = 'fut ' + y.toLocaleString('en-IN', {maximumFractionDigits: 1});
   } catch (e) { hb.style.display = 'none'; }
 }
 
@@ -375,35 +369,34 @@ function isReplay () { return state.date && state.today && state.date !== state.
 // tag instead. Driven by the 5s basis poll — light, not per-tick.
 function updateSpotBox () {
   const bi = state.basis_info;
-  const pxEl = document.getElementById('spot_px');
-  const chEl = document.getElementById('spot_chg');
-  // The true index spot is only sampled every ~60s by the recorder. To move it
-  // PER TICK, anchor on the recorded spot but track the live futures tick:
-  //   live_spot = futures_tick − basis   (basis = futures − spot, slow-moving)
-  // Falls back to the recorded spot when there's no live tick / no basis.
-  let spot = (bi && bi.spot != null) ? bi.spot : null;
-  let live = false;
-  if (bi && bi.basis != null && state.tip && state.tip.y != null) {
-    spot = state.tip.y - bi.basis;   // state.tip.y = latest futures close (per tick)
-    live = true;
-  }
-  if (pxEl) pxEl.textContent = (spot != null)
-    ? spot.toLocaleString('en-IN', {maximumFractionDigits: 1}) : '—';
-  if (chEl) {
-    // Live % vs the index's prior close (= recorded spot − recorded day-change).
-    let pct = (bi && bi.change_pct != null) ? bi.change_pct : null;
-    let chg = (bi && bi.change != null) ? bi.change : null;
-    if (live && bi && bi.change != null && bi.spot != null) {
-      const prev = bi.spot - bi.change;          // index prior close
-      if (prev) { chg = spot - prev; pct = chg / prev * 100; }
-    }
+  // FUTURE = latest futures tick (state.tip.y, per tick); fallback to /basis fut.
+  const fut = (state.tip && state.tip.y != null) ? state.tip.y
+            : (bi && bi.fut != null ? bi.fut : null);
+  // INDEX = futures − basis (per tick), anchored on the recorded index spot.
+  let idx = (bi && bi.spot != null) ? bi.spot : null;
+  if (bi && bi.basis != null && fut != null) idx = fut - bi.basis;
+
+  const setRow = (pxId, chId, val, prevClose, fbPct, fbChg) => {
+    const px = document.getElementById(pxId), ch = document.getElementById(chId);
+    if (px) px.textContent = (val != null)
+      ? val.toLocaleString('en-IN', {maximumFractionDigits: 1}) : '—';
+    if (!ch) return;
+    let pct = fbPct, chg = fbChg;
+    if (val != null && prevClose) { chg = val - prevClose; pct = chg / prevClose * 100; }
     if (pct != null) {
-      const sign = pct > 0 ? '+' : '';
-      const pts = (chg != null) ? `${sign}${chg.toFixed(1)} ` : '';
-      chEl.textContent = `${pts}(${sign}${pct.toFixed(2)}%)`;
-      chEl.className = 'spot-chg ' + (pct > 0.001 ? 'up' : pct < -0.001 ? 'down' : 'flat');
-    } else { chEl.textContent = '—'; chEl.className = 'spot-chg flat'; }
-  }
+      const s = pct > 0 ? '+' : '';
+      ch.textContent = `${chg != null ? s + chg.toFixed(1) + ' ' : ''}(${s}${pct.toFixed(2)}%)`;
+      ch.className = 'spot-chg ' + (pct > 0.001 ? 'up' : pct < -0.001 ? 'down' : 'flat');
+    } else { ch.textContent = '—'; ch.className = 'spot-chg flat'; }
+  };
+
+  // INDEX % vs index prior close (= recorded spot − recorded day-change).
+  const idxPrev = (bi && bi.spot != null && bi.change != null) ? bi.spot - bi.change : null;
+  setRow('spot_px', 'spot_chg', idx, idxPrev, bi ? bi.change_pct : null, bi ? bi.change : null);
+  // FUTURE % vs prior-day FUTURES close (pivots prior_day.close = futures series).
+  const futPrev = (state.pivots && state.pivots.prior_day) ? state.pivots.prior_day.close : null;
+  setRow('fut_px', 'fut_chg', fut, futPrev, null, null);
+
   updateContango();
 }
 
