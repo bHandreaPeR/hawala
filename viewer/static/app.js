@@ -989,9 +989,10 @@ function redrawAll () {
     if (Math.abs(d) >= p70Delta && p70Delta > 0 && rng <= 0.6 * medRange) {
       annos.push({
         x: c.bucket, y: c.high + 1.2*cs, xref:'x', yref:'y',
-        text:'🅐', showarrow:false, font:{size:12},
-        hovertext:`Absorption — Δ=${fmtNum(d)} but range only ${rng.toFixed(1)}pts `
-                + `(≤60% of median ${medRange.toFixed(1)}). Aggression absorbed; price pinned.`,
+        // Heart: green = buy-side absorption (Δ≥0), red = sell-side (Δ<0).
+        text: d >= 0 ? '💚' : '❤️', showarrow:false, font:{size:13},
+        hovertext:`Absorption (${d>=0?'buy':'sell'}-side) — Δ=${fmtNum(d)} but range only `
+                + `${rng.toFixed(1)}pts (≤60% of median ${medRange.toFixed(1)}). Price pinned.`,
       });
     }
     // ── REJECTION (pin-bar): one wick ≥ 60% of the bar's range — price probed
@@ -1005,16 +1006,18 @@ function redrawAll () {
     if (bigEnough && upWick >= 0.60 * rng) {
       annos.push({
         x:c.bucket, y:c.high + 1.5*cs, xref:'x', yref:'y',
-        text:'REJECTION ⤓', showarrow:false, xanchor:'center', yanchor:'bottom',
-        font:{size:9, color:'#fff'}, bgcolor:'rgba(239,83,80,0.82)', borderpad:2,
+        // Red cross above = highs rejected (bearish).
+        text:'✗', showarrow:false, xanchor:'center', yanchor:'bottom',
+        font:{size:15, color:'#ef5350'},
         hovertext:`Rejection — upper wick ${upWick.toFixed(1)}pt `
                 + `(${(100*upWick/rng).toFixed(0)}% of range). Highs rejected (bearish).`,
       });
     } else if (bigEnough && dnWick >= 0.60 * rng) {
       annos.push({
         x:c.bucket, y:c.low - 1.5*cs, xref:'x', yref:'y',
-        text:'⤒ REJECTION', showarrow:false, xanchor:'center', yanchor:'top',
-        font:{size:9, color:'#fff'}, bgcolor:'rgba(38,166,154,0.82)', borderpad:2,
+        // Green cross below = lows rejected (bullish).
+        text:'✗', showarrow:false, xanchor:'center', yanchor:'top',
+        font:{size:15, color:'#26a69a'},
         hovertext:`Rejection — lower wick ${dnWick.toFixed(1)}pt `
                 + `(${(100*dnWick/rng).toFixed(0)}% of range). Lows rejected (bullish).`,
       });
@@ -1031,12 +1034,11 @@ function redrawAll () {
       // into near-zero delta doesn't count as a reversal.
       if (flip && (isHi || isLo) && Math.abs(d) >= p70Delta && p70Delta > 0) {
         annos.push({
-          x: c.bucket, y: isHi ? c.high + 3.0*cs : c.low - 3.0*cs,
-          xref:'x', yref:'y', text: isHi ? 'REVERSAL ⤵' : 'REVERSAL ⤴',
+          x: c.bucket, y: isHi ? c.high + 2.8*cs : c.low - 2.8*cs,
+          xref:'x', yref:'y', text:'🚦',   // traffic signal — both directions
           showarrow:false, xanchor:'center', yanchor: isHi ? 'bottom' : 'top',
-          font:{size:9, color:'#fff'},
-          bgcolor: isHi ? 'rgba(239,83,80,0.88)' : 'rgba(38,166,154,0.88)', borderpad:2,
-          hovertext:`Delta-flip reversal at local ${isHi?'high':'low'} `
+          font:{size:13},
+          hovertext:`Reversal — delta-flip at local ${isHi?'high':'low'} `
                   + `(Δ ${fmtNum(prev)}→${fmtNum(d)})`,
         });
       }
@@ -1499,7 +1501,7 @@ function redrawAll () {
       x: k.bucket, y: dTotal[i] + dMaxTot * 0.04, xref:'x3', yref:'y3',
       text: `${sign}${fmtNum(Math.abs(net))}`, showarrow:false,
       xanchor:'center', yanchor:'bottom',
-      font:{size:8, color: net > 0 ? '#3fd6c4' : net < 0 ? '#ff7b72' : '#8a93a0'},
+      font:{size:9, color: net > 0 ? '#3fd6c4' : net < 0 ? '#ff7b72' : '#8a93a0'},
     });
   });
 
@@ -1536,17 +1538,19 @@ function redrawAll () {
              dtick: yDtick, tickformat:',d',
              gridcolor:GRID, gridwidth:1, zeroline:false},
     // Session BS-summary pane — more vertical gridlines (nticks) for scale.
+    // Bars are now STACKED (sell+buy, all positive) so there's no negative
+    // side — clamp the axis to [0, max] to drop the unused left half.
     xaxis2: {domain:[0.73, 0.84], anchor:'y2', title:'BS qty',
-             showticklabels:true, tickfont:{size:9}, nticks:6,
-             range:[-prof2Max, prof2Max],
+             showticklabels:true, tickfont:{size:9}, nticks:5,
+             range:[0, prof2Max],
              gridcolor:GRID, zeroline:true, zerolinecolor:'rgba(255,255,255,0.18)'},
     yaxis2: {domain:[0.32, 1], matches:'y', showticklabels:false},
-    // Delta pane — pushed lower (bigger gap above) + matches:'x' so it mirrors
-    // the candle pane's zoom/pan in lockstep.
+    // Δ pane — taller (domain top 0.18→0.26) so the stacked bars + their qty
+    // labels are readable; matches:'x' so it mirrors the candle pane's zoom.
     xaxis3: {type:'date', domain:[0, 0.72], anchor:'y3', matches:'x',
              tickformat:'%H:%M', gridcolor:GRID,
              showticklabels:true, tickfont:{size:9}},
-    yaxis3: {domain:[0, 0.18], title:'BS·Δ qty', gridcolor:GRID,
+    yaxis3: {domain:[0, 0.26], title:'BS·Δ qty', gridcolor:GRID,
              tickfont:{size:9}, nticks:4, zeroline:true,
              range:[0, dMaxTot * 1.18],
              zerolinecolor:'rgba(255,255,255,0.18)'},
@@ -1594,12 +1598,12 @@ function redrawAll () {
     {x: dx, y: dSell, type:'bar', base: 0, xaxis:'x3', yaxis:'y3',
      marker:{color:'rgba(239,83,80,0.85)'},
      text: dSellLabels, textposition:'inside', insidetextanchor:'middle',
-     cliponaxis:false, textfont:{size:8, color:'#fff'},
+     cliponaxis:false, textfont:{size:9, color:'#fff'},
      hovertemplate:'%{x}<br>sell=%{y:.0f}<extra></extra>'},
     {x: dx, y: dBuy, type:'bar', base: dSell, xaxis:'x3', yaxis:'y3',
      marker:{color:'rgba(38,166,154,0.85)'},
      text: dBuyLabels, textposition:'inside', insidetextanchor:'middle',
-     cliponaxis:false, textfont:{size:8, color:'#fff'},
+     cliponaxis:false, textfont:{size:9, color:'#fff'},
      hovertemplate:'%{x}<br>buy=%{y:.0f}<extra></extra>'},
     // ─ Session DOM profile (drawn FIRST so live top-5 lands on top) ──────
     // Faint full-day mean resting qty bars. Top-3 walls each side get
