@@ -769,7 +769,9 @@ function renderPreMarket () {
       if (px == null) return;
       const y = px + basis;
       line(y, c, d, 1.3);
-      label(y, `<b>${nm}</b> ${px.toFixed(0)}${basis?`→${y.toFixed(0)}`:''}`, c, 'right');
+      // MaxPain: line + hover only, no persistent label (matches live view).
+      if (nm !== 'MaxPain')
+        label(y, `<b>${nm}</b> ${px.toFixed(0)}${basis?`→${y.toFixed(0)}`:''}`, c, 'right');
       addHover(y, `${nm} strike ${px.toFixed(0)} · option-OI`);
     });
   }
@@ -1194,6 +1196,9 @@ function redrawAll () {
         line:{color:L.color, width:1.3, dash:L.dash}});
       addLevelHover(yAdj,
         `${L.name} strike ${L.px.toFixed(0)}${basisAdj?` → fut ${yAdj.toFixed(0)}`:''} — ${L.note} · PCR ${ol.pcr_oi}${basisNote}`);
+      // MaxPain: line + hover only, no persistent label (declutters the chart;
+      // the value still shows on hover via addLevelHover above).
+      if (L.name === 'MaxPain') continue;
       annos.push({x:xRange[1], y:yAdj, xref:'x', yref:'y',
         text:`<b>${L.name}</b> ${L.px.toFixed(0)}${basisAdj?`→${yAdj.toFixed(0)}`:''}${L.name==='CE-wall'?staleTag:''}`,
         showarrow:false, xanchor:'right', yanchor:'top',
