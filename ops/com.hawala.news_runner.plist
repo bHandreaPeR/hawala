@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  News runner — 24/7. Runs news.runner with --always so the pipeline scores
+  around the clock: the viewer's MACRO positioning card + the MACRO-channel
+  Telegram alerts stay fresh overnight/pre-market (overnight US + geopolitical
+  news gaps the Indian open). Alerts are gated by the existing caps
+  (score>=0.60, conf>=0.70, <=4/hr, <=12/day, 120-min theme cooldown), so 24/7
+  running does NOT spam — only high-conviction news fires off-hours.
+
+  KeepAlive = always-on, auto-restart on crash. The runner has a singleton
+  guard, so it coexists safely with the legacy 09:00 cron and manual starts.
+
+  IMPORTANT: remove the old "0 9 * * 1-5 ... -m news.runner" crontab line so
+  the cron start doesn't fight the launchd agent (the singleton guard makes it
+  safe either way, but the cron line is now redundant).
+
+  Install:
+      cp ops/com.hawala.news_runner.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.hawala.news_runner.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hawala.news_runner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/opt/anaconda3/bin/python3</string>
+        <string>-m</string>
+        <string>news.runner</string>
+        <string>--always</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NEWS_CYCLE_SEC</key>
+        <string>60</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/news_bot/news_runner_launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/subhransubaboo/Claude Projects/Hawala v2/Hawala v2/logs/news_bot/news_runner_launchd.err</string>
+</dict>
+</plist>

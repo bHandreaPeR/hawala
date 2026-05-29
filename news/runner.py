@@ -19,6 +19,7 @@ import argparse
 import logging
 import os
 import signal as _signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -157,6 +158,24 @@ def _setup_logging() -> None:
     )
 
 
+def _another_instance_running() -> bool:
+    """True if a DIFFERENT live `news.runner` process owns the PID file."""
+    if not PID_PATH.exists():
+        return False
+    try:
+        pid = int(PID_PATH.read_text().strip())
+    except Exception:
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        out = subprocess.check_output(['ps', '-p', str(pid), '-o', 'command='],
+                                      text=True, timeout=5)
+        return 'news.runner' in out          # alive AND actually our runner
+    except Exception:
+        return False                          # dead/recycled PID → free to start
+
+
 _running = True
 
 
@@ -173,6 +192,14 @@ def main() -> None:
     args = p.parse_args()
 
     _setup_logging()
+
+    # Singleton guard: with a 24/7 KeepAlive agent + the legacy 09:00 cron +
+    # ad-hoc manual starts, multiple instances could otherwise run at once
+    # (double alerts, racing state writes). If a live news.runner already owns
+    # the PID file, this instance exits cleanly.
+    if not args.once and _another_instance_running():
+        log.info("another news.runner is already alive — exiting (singleton).")
+        return
 
     # Write PID
     try:
@@ -195,7 +222,11 @@ def main() -> None:
 
     while _running:
         now = _now()
-        in_market = args.always or _is_market_window(now)
+        # Decouple "should we poll" from "is the market open":
+        #   market_now → real 09:00-15:30 session (drives the EOD digest)
+        #   poll_now   → whether to scrape this cycle (--always = 24/7)
+        market_now = _is_market_window(now)
+        poll_now   = args.always or market_now
 
         # Pre-open auction snapshot — once per day, when clock crosses 09:10.
         # news.runner is the only process alive before the v3 runners start
@@ -213,15 +244,15 @@ def main() -> None:
             log.exception("Pre-open snapshot failed: %s", e)
 
         # Edge: in-market → out-of-market (market just closed) → emit EOD digest
-        if was_in_market and not in_market:
+        if was_in_market and not market_now:
             try:
                 from news.digest import emit_eod_digest
                 emit_eod_digest()
             except Exception as e:
                 log.exception("emit_eod_digest failed: %s", e)
-        was_in_market = in_market
+        was_in_market = market_now
 
-        if not in_market:
+        if not poll_now:
             wait = _seconds_to_next_open(now)
             log.info("Outside market hours — sleeping %.0fs until next open", wait)
             # Sleep in chunks so SIGTERM is responsive
