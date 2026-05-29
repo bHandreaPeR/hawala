@@ -112,8 +112,13 @@ def _load_telegram() -> tuple[str, list[str]]:
                 env[k] = v
     except Exception:
         return '', []
-    tok = env.get('TELEGRAM_BOT_TOKEN_MACRO', '').strip()
-    chats = [c.strip() for c in env.get('TELEGRAM_CHAT_IDS_MACRO', '').split(',') if c.strip()]
+    # Sanity/health alerts go to the dedicated SANITY bot if configured,
+    # else fall back to the MACRO bot so nothing breaks before it's set up.
+    tok = (env.get('TELEGRAM_BOT_TOKEN_SANITY', '').strip()
+           or env.get('TELEGRAM_BOT_TOKEN_MACRO', '').strip())
+    raw = (env.get('TELEGRAM_CHAT_IDS_SANITY', '').strip()
+           or env.get('TELEGRAM_CHAT_IDS_MACRO', '').strip())
+    chats = [c.strip() for c in raw.split(',') if c.strip()]
     return tok, chats
 
 

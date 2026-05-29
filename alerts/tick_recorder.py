@@ -173,9 +173,11 @@ def _send_macro_alert(text: str) -> None:
     try:
         from alerts import telegram
         env = _load_env()
-        token = (env.get('TELEGRAM_BOT_TOKEN_MACRO')
+        token = (env.get('TELEGRAM_BOT_TOKEN_SANITY')
+                 or env.get('TELEGRAM_BOT_TOKEN_MACRO')
                  or env.get('TELEGRAM_BOT_TOKEN') or '').strip()
-        chats_raw = (env.get('TELEGRAM_CHAT_IDS_MACRO')
+        chats_raw = (env.get('TELEGRAM_CHAT_IDS_SANITY')
+                     or env.get('TELEGRAM_CHAT_IDS_MACRO')
                      or env.get('TELEGRAM_CHAT_IDS') or '').strip()
         chats = [c.strip() for c in chats_raw.split(',') if c.strip()]
         if not token or not chats:

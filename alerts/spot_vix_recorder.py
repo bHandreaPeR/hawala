@@ -187,12 +187,21 @@ def main() -> None:
                 ltp     = float(r.get('last_price') or 0.0)
                 if ltp == 0:
                     raise ValueError('zero ltp')
-                day_open  = float(r.get('day_open')  or 0.0)
-                day_high  = float(r.get('day_high')  or 0.0)
-                day_low   = float(r.get('day_low')   or 0.0)
-                day_close = float(r.get('previous_close') or 0.0)
-                change      = ltp - day_close if day_close else 0.0
-                change_pct  = (change / day_close * 100.0) if day_close else 0.0
+                # Groww returns OHLC nested under 'ohlc' and the day move under
+                # 'day_change'/'day_change_perc' — NOT day_open/previous_close
+                # (those keys don't exist, which is why change was always 0).
+                ohlc = r.get('ohlc') or {}
+                day_open  = float(ohlc.get('open') or 0.0)
+                day_high  = float(ohlc.get('high') or 0.0)
+                day_low   = float(ohlc.get('low')  or 0.0)
+                day_close = float(ohlc.get('close') or 0.0)   # prior close
+                change      = float(r.get('day_change') or 0.0)
+                change_pct  = float(r.get('day_change_perc') or 0.0)
+                # Fallback compute if Groww didn't supply the day move.
+                if not change and day_close:
+                    change = ltp - day_close
+                if not change_pct and day_close:
+                    change_pct = change / day_close * 100.0
                 writers[inst].write({
                     'ts_ms':       int(time.time() * 1000),
                     'ltp':         ltp,

@@ -151,8 +151,12 @@ def _telegram(msg: str) -> bool:
     env = {l.split('=',1)[0].strip(): l.split('=',1)[1].strip()
            for l in env_f.read_text().splitlines()
            if '=' in l and not l.strip().startswith('#')}
-    tok = env.get('TELEGRAM_BOT_TOKEN_MACRO','').strip()
-    chats = [c.strip() for c in env.get('TELEGRAM_CHAT_IDS_MACRO','').split(',') if c.strip()]
+    # Prefer the dedicated SANITY bot; fall back to MACRO if not yet configured.
+    tok = (env.get('TELEGRAM_BOT_TOKEN_SANITY','').strip()
+           or env.get('TELEGRAM_BOT_TOKEN_MACRO','').strip())
+    raw = (env.get('TELEGRAM_CHAT_IDS_SANITY','').strip()
+           or env.get('TELEGRAM_CHAT_IDS_MACRO','').strip())
+    chats = [c.strip() for c in raw.split(',') if c.strip()]
     if not tok or not chats:
         return False
     try:

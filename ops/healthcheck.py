@@ -57,17 +57,38 @@ NOW_IST    = datetime.now(IST)
 TODAY_IST  = NOW_IST.date()
 
 
+try:
+    from ops.market_calendar import is_trading_day as _is_trading_day
+except Exception:                       # pragma: no cover — fall back to weekday-only
+    _is_trading_day = None
+
+
+def _trading(d: date) -> bool:
+    """True if d is a trading day. Holiday-aware when market_calendar is
+    available; otherwise weekday-only."""
+    if _is_trading_day is not None:
+        try:
+            return bool(_is_trading_day(d))
+        except Exception:
+            pass
+    return d.weekday() < 5
+
+
 def _last_trading_day() -> date:
-    """Last weekday strictly before today (Sat/Sun → Friday)."""
+    """Last TRADING day strictly before today — skips weekends AND holidays.
+    (Was weekday-only, which falsely flagged 'data missing' the day after a
+    holiday, e.g. checking a holiday Thursday for yesterday's caches/logs.)"""
     d = TODAY_IST - timedelta(days=1)
-    while d.weekday() >= 5:
+    for _ in range(40):
+        if _trading(d):
+            return d
         d -= timedelta(days=1)
     return d
 
 
 def _today_or_last_trading_day() -> date:
-    """If today is a weekday, return today; otherwise last trading day."""
-    if TODAY_IST.weekday() < 5:
+    """If today is a TRADING day, return today; otherwise last trading day."""
+    if _trading(TODAY_IST):
         return TODAY_IST
     return _last_trading_day()
 
@@ -455,8 +476,12 @@ def telegram_alert(checks: list, n_fail: int, n_warn: int) -> bool:
     env = {l.split('=',1)[0].strip(): l.split('=',1)[1].strip()
            for l in TOKEN_ENV.read_text().splitlines()
            if '=' in l and not l.strip().startswith('#')}
-    tok = env.get('TELEGRAM_BOT_TOKEN_MACRO','').strip()
-    chats = [c.strip() for c in env.get('TELEGRAM_CHAT_IDS_MACRO','').split(',') if c.strip()]
+    # Sanity/health alerts → dedicated SANITY bot if set, else MACRO fallback.
+    tok = (env.get('TELEGRAM_BOT_TOKEN_SANITY','').strip()
+           or env.get('TELEGRAM_BOT_TOKEN_MACRO','').strip())
+    raw = (env.get('TELEGRAM_CHAT_IDS_SANITY','').strip()
+           or env.get('TELEGRAM_CHAT_IDS_MACRO','').strip())
+    chats = [c.strip() for c in raw.split(',') if c.strip()]
     if not tok or not chats:
         return False
 
