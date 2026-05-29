@@ -130,9 +130,20 @@ def _read_ticks(inst: str, day: str, since_byte: int
     if not lines:
         return pd.DataFrame(), consumed_to
     from io import StringIO
+    # Use the file's ACTUAL header for column names — the recorder's schema has
+    # grown derived columns (now 17), and a hardcoded 12-col list shifted every
+    # field (ts_ms ended up holding the 'rule' value 'QUOTE' → int() crash in
+    # the WS handler → socket closed → client reconnect loop). Read the header
+    # once per call (cheap) so we always stay aligned with the writer.
     try:
-        tail = pd.read_csv(StringIO('\n'.join(lines)),
-                           names=_CSV_COLS, header=None)
+        with p.open('r') as hf:
+            cols = hf.readline().strip().split(',')
+        if len(cols) < 5 or cols[0] != 'ts_ms':
+            cols = _CSV_COLS
+    except Exception:
+        cols = _CSV_COLS
+    try:
+        tail = pd.read_csv(StringIO('\n'.join(lines)), names=cols, header=None)
     except Exception:
         return pd.DataFrame(), consumed_to
     return tail, consumed_to
