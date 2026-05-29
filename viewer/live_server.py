@@ -664,6 +664,15 @@ def _build_option_levels(inst: str, day: str) -> dict:
         allk = list(ce_oi) + list(pe_oi)
         spot = sum(allk) / len(allk) if allk else None
 
+    # Strikes are INDEX-referenced, so the band + at/below(above) cutoffs must
+    # compare against the INDEX spot — NOT the futures close, which sits ~basis
+    # higher and would misclassify above-index strikes (e.g. 24000 when the
+    # index is 23950) as "support". Plotting still adds the basis to map the
+    # chosen strike onto the futures axis (done client-side).
+    _idx, _, _, _ = _latest_true_spot(inst, day_used)
+    if _idx:
+        spot = _idx
+
     # Band = strikes within ±5% of spot (the liquid, meaningful S&R zone).
     def _in_band(k):
         return spot is None or abs(k - spot) <= 0.05 * spot
