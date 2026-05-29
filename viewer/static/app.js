@@ -289,6 +289,9 @@ function positionHeartbeat () {
     hb.style.left = (xa._offset + xa.l2p(x)) + 'px';
     hb.style.top  = (ya._offset + ya.l2p(y)) + 'px';
     hb.style.display = 'flex';
+    // Always show the live futures price at the tip (no hover required).
+    const tag = document.getElementById('hb_tag');
+    if (tag) tag.textContent = 'fut ' + y.toLocaleString('en-IN', {maximumFractionDigits: 1});
   } catch (e) { hb.style.display = 'none'; }
 }
 
@@ -374,12 +377,29 @@ function updateSpotBox () {
   const bi = state.basis_info;
   const pxEl = document.getElementById('spot_px');
   const chEl = document.getElementById('spot_chg');
-  if (pxEl) pxEl.textContent = (bi && bi.spot != null)
-    ? bi.spot.toLocaleString('en-IN', {maximumFractionDigits: 1}) : '—';
+  // The true index spot is only sampled every ~60s by the recorder. To move it
+  // PER TICK, anchor on the recorded spot but track the live futures tick:
+  //   live_spot = futures_tick − basis   (basis = futures − spot, slow-moving)
+  // Falls back to the recorded spot when there's no live tick / no basis.
+  let spot = (bi && bi.spot != null) ? bi.spot : null;
+  let live = false;
+  if (bi && bi.basis != null && state.tip && state.tip.y != null) {
+    spot = state.tip.y - bi.basis;   // state.tip.y = latest futures close (per tick)
+    live = true;
+  }
+  if (pxEl) pxEl.textContent = (spot != null)
+    ? spot.toLocaleString('en-IN', {maximumFractionDigits: 1}) : '—';
   if (chEl) {
-    if (bi && bi.change_pct != null) {
-      const pct = bi.change_pct, sign = pct > 0 ? '+' : '';
-      const pts = (bi.change != null) ? `${sign}${bi.change.toFixed(1)} ` : '';
+    // Live % vs the index's prior close (= recorded spot − recorded day-change).
+    let pct = (bi && bi.change_pct != null) ? bi.change_pct : null;
+    let chg = (bi && bi.change != null) ? bi.change : null;
+    if (live && bi && bi.change != null && bi.spot != null) {
+      const prev = bi.spot - bi.change;          // index prior close
+      if (prev) { chg = spot - prev; pct = chg / prev * 100; }
+    }
+    if (pct != null) {
+      const sign = pct > 0 ? '+' : '';
+      const pts = (chg != null) ? `${sign}${chg.toFixed(1)} ` : '';
       chEl.textContent = `${pts}(${sign}${pct.toFixed(2)}%)`;
       chEl.className = 'spot-chg ' + (pct > 0.001 ? 'up' : pct < -0.001 ? 'down' : 'flat');
     } else { chEl.textContent = '—'; chEl.className = 'spot-chg flat'; }
@@ -1006,6 +1026,7 @@ function redrawAll () {
   const visCandles = visibleCandles.length;
 
   state.tip = {x: lastBk, y: candles[candles.length - 1].close};
+  updateSpotBox();   // tick-live: tracks the latest futures close − basis
 
   // ── Pivot lines (classic floor pivots from prior day's OHLC) ──────────
   // Drawn AFTER xRange/yRange are defined. Levels outside the visible
