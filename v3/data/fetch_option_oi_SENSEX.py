@@ -33,6 +33,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from v3.data.oi_cache_merge import merge_day_oi
+
 CACHE_FILE  = ROOT / 'v3' / 'cache' / 'option_oi_1m_SENSEX.pkl'
 CANDLE_FILE = ROOT / 'v3' / 'cache' / 'candles_1m_SENSEX.pkl'
 STRIKE_BAND = 1500   # ± from open price
@@ -325,10 +327,12 @@ def fetch_all_days(force: bool = False, max_days: int = 0):
             continue
 
         day_data = _fetch_option_oi_day(g, td, open_px)
-        cache[str(td)] = day_data
+        # Merge, never overwrite — historical candles omit OI for active
+        # contracts; preserve real OI written live by the daemon.
+        cache[str(td)] = merge_day_oi(cache.get(str(td)), day_data)
         with open(CACHE_FILE, 'wb') as f:
             pickle.dump(cache, f)
-        log.info("Saved SENSEX OI date=%s strikes=%d", td, len(day_data))
+        log.info("Saved SENSEX OI date=%s strikes=%d", td, len(cache[str(td)]))
         fetched_this_run += 1
         time.sleep(1.0)
 

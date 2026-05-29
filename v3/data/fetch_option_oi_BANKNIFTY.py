@@ -36,6 +36,8 @@ from growwapi.groww.exceptions import GrowwAPIRateLimitException, GrowwAPIAuthen
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from v3.data.oi_cache_merge import merge_day_oi
+
 CACHE_FILE  = ROOT / 'v3' / 'cache' / 'option_oi_1m_BANKNIFTY.pkl'
 CANDLE_FILE = ROOT / 'v3' / 'cache' / 'candles_1m_BANKNIFTY.pkl'
 STRIKE_BAND = 2000    # ± from open price
@@ -293,11 +295,13 @@ def fetch_all_days(start_date: date = None, force: bool = False, max_days: int =
                 day_data = _fetch_option_oi_day(g, td, open_px)
             else:
                 raise
-        cache[str(td)] = day_data
+        # Merge, never overwrite — historical candles omit OI for active
+        # contracts; preserve real OI written live by the daemon/runners.
+        cache[str(td)] = merge_day_oi(cache.get(str(td)), day_data)
         with open(CACHE_FILE, 'wb') as f:
             pickle.dump(cache, f)
         log.info(
-            "Saved BANKNIFTY OI date=%s strikes=%d", td, len(day_data)
+            "Saved BANKNIFTY OI date=%s strikes=%d", td, len(cache[str(td)])
         )
         fetched += 1
         time.sleep(1.5)   # 0.5 → 1.5 between days

@@ -73,6 +73,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from v3.data.oi_cache_merge import merge_day_oi
+
 CACHE_FILE  = ROOT / 'v3' / 'cache' / 'option_oi_1m_BANKNIFTY.pkl'
 CANDLE_FILE = ROOT / 'v3' / 'cache' / 'candles_1m_BANKNIFTY.pkl'
 STRIKE_BAND = 1500   # ± from open price
@@ -318,11 +320,13 @@ def fetch_all_days(force: bool = False, max_days: int = 0):
 
         try:
             day_data = _fetch_option_oi_day(g, td, open_px)
-            cache[str(td)] = day_data
+            # Merge, never overwrite — preserve real OI captured live (active
+            # contracts return no OI in historical candles).
+            cache[str(td)] = merge_day_oi(cache.get(str(td)), day_data)
             # Save incrementally
             with open(CACHE_FILE, 'wb') as f:
                 pickle.dump(cache, f)
-            log.info(f"Saved {td}: {len(day_data)} strikes")
+            log.info(f"Saved {td}: {len(cache[str(td)])} strikes")
             fetched_this_run += 1
         except Exception as e:
             log.error(f"FAILED {td}: {e}")

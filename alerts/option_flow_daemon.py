@@ -88,6 +88,11 @@ CONV_ALPHA  = float(os.environ.get("OPTION_FLOW_CONV_ALPHA", "0.25"))  # newest-
 CONV_DECAY  = float(os.environ.get("OPTION_FLOW_CONV_DECAY", "0.02"))  # quiet-tick decay
 CONV_Z_MIN  = float(os.environ.get("OPTION_FLOW_CONV_ZMIN",  "2.5"))   # anomaly z-bar
 
+# Per-minute option OI is persisted to option_oi_1m_<INST>.pkl this often (and
+# once more at EOD). 60s keeps the viewer's S&R walls fresh without thrashing
+# disk — the in-memory accumulator already holds the full session.
+OI_PERSIST_SECS = int(os.environ.get("OPTION_FLOW_OI_PERSIST_SECS", "60"))
+
 CACHE_DIR    = ROOT / 'v3' / 'cache'
 LOG_DIR      = ROOT / 'logs' / 'macro_bot'
 
@@ -181,6 +186,114 @@ def _atomic_write_json(path: pathlib.Path, data: dict | list) -> None:
         try:    os.unlink(tmp)
         except: pass
         raise
+
+
+def _atomic_write_pickle(path: pathlib.Path, obj) -> None:
+    """Pickle `obj` to `path` atomically (tmp file in same dir + os.replace).
+
+    The viewer reads option_oi_1m_<INST>.pkl while the daemon writes it every
+    minute — a non-atomic dump would expose a truncated file. os.replace is
+    atomic on POSIX, so a reader always sees either the old or new file whole."""
+    import pickle as _pickle
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix=f'.{path.name}.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            _pickle.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:    os.unlink(tmp)
+        except: pass
+        raise
+
+
+def _accumulate_oi(inst: str, chain: dict, oi_accum: dict,
+                   last_oi_minute: dict) -> None:
+    """Append one per-strike OI row per minute from the live option chain.
+
+    The daemon polls every POLL_SECS (~5s); we down-sample to 1 row/minute so
+    the on-disk series matches the '1m' cache the viewer/backtests expect. The
+    first poll of each new IST minute wins (value at :00s).
+
+    oi_accum[inst][strike] = {'CE': [(ts, close, volume, oi)], 'PE': [...]}
+
+    Only strikes within the configured ATM band are kept (matches the runners'
+    ±band and what the viewer plots after its ±5% filter) — the full chain is
+    ~150 strikes and the far-OTM tails are noise for S&R walls.
+    """
+    import pandas as pd
+    now_min = pd.Timestamp(datetime.now(IST)).floor('min').tz_localize(None)
+    if last_oi_minute.get(inst) == now_min:
+        return
+    last_oi_minute[inst] = now_min
+    cfg  = INSTRUMENTS[inst]
+    spot = float(chain.get('underlying_ltp', 0) or 0)
+    band = cfg['strike_step'] * cfg['atm_band_strikes']
+    acc = oi_accum.setdefault(inst, {})
+    for K in chain.get('strikes', []):
+        if spot > 0 and abs(K - spot) > band:
+            continue
+        sides = acc.setdefault(K, {'CE': [], 'PE': []})
+        sides['CE'].append((now_min,
+                            chain['ce_ltp'].get(K, 0.0),
+                            chain['ce_vol'].get(K, 0.0),
+                            chain['ce_oi'].get(K, 0.0)))
+        sides['PE'].append((now_min,
+                            chain['pe_ltp'].get(K, 0.0),
+                            chain['pe_vol'].get(K, 0.0),
+                            chain['pe_oi'].get(K, 0.0)))
+
+
+def _persist_option_oi(inst: str, oi_accum: dict) -> None:
+    """Write the accumulated per-minute OI for `inst` into option_oi_1m_<INST>.pkl.
+
+    Real-time OI from get_option_chain (open_interest) — the reliable source.
+    The historical-candle fetchers (fetch_option_oi_*.py) can't supply OI for
+    a still-active weekly contract, so the daemon is the live writer the viewer
+    docstring already names.
+
+    Cache format (matches v3/data/fetch_option_oi_*.py and the live runners):
+        {date_str: {strike: {'CE': DataFrame[ts, close, volume, oi, oi_raw],
+                              'PE': DataFrame[ts, close, volume, oi, oi_raw]}}}
+
+    Merges into today's entry rather than overwriting it wholesale, so strikes
+    written by a runner (wider band) survive alongside the daemon's strikes."""
+    import pandas as pd
+    import pickle as _pickle
+    inst_accum = oi_accum.get(inst) or {}
+    if not inst_accum:
+        return
+    path = CACHE_DIR / f'option_oi_1m_{inst}.pkl'
+    try:
+        cache: dict = {}
+        if path.exists():
+            with open(path, 'rb') as fh:
+                cache = _pickle.load(fh)
+        today_str = datetime.now(IST).strftime('%Y-%m-%d')
+        existing = cache.get(today_str)
+        day_entry: dict = dict(existing) if isinstance(existing, dict) else {}
+        cols = ['ts', 'close', 'volume', 'oi', 'oi_raw']
+        for strike, sides in inst_accum.items():
+            entry: dict = {}
+            for side in ('CE', 'PE'):
+                rows = sides.get(side, [])
+                if not rows:
+                    entry[side] = pd.DataFrame(columns=cols)
+                    continue
+                df = pd.DataFrame(rows, columns=['ts', 'close', 'volume', 'oi'])
+                df['ts']     = pd.to_datetime(df['ts'])
+                df['oi_raw'] = pd.to_numeric(df['oi'], errors='coerce')
+                df['oi']     = df['oi_raw'].ffill().fillna(0)
+                entry[side]  = df[cols].copy()
+            day_entry[strike] = entry
+        cache[today_str] = day_entry
+        _atomic_write_pickle(path, cache)
+        log.debug("[%s] persist_option_oi: %d strikes → %s",
+                  inst, len(day_entry), path)
+    except Exception as e:
+        log.warning("[%s] persist_option_oi FAILED: %s — data stays in memory",
+                    inst, e)
 
 
 def _safe_read_json(path: pathlib.Path) -> dict | None:
@@ -287,6 +400,8 @@ def _fetch_chain(g, inst: str, expiry: str) -> dict | None:
     pe_oi:  dict[float, float] = {}
     ce_ltp: dict[float, float] = {}
     pe_ltp: dict[float, float] = {}
+    ce_vol: dict[float, float] = {}
+    pe_vol: dict[float, float] = {}
 
     for K_s, data in raw.items():
         try:
@@ -300,6 +415,8 @@ def _fetch_chain(g, inst: str, expiry: str) -> dict | None:
         pe_oi[K]  = float(pe.get('open_interest', 0) or 0)
         ce_ltp[K] = float(ce.get('ltp', 0) or 0)
         pe_ltp[K] = float(pe.get('ltp', 0) or 0)
+        ce_vol[K] = float(ce.get('volume', 0) or 0)
+        pe_vol[K] = float(pe.get('volume', 0) or 0)
 
     strikes_int.sort()
     return {
@@ -309,6 +426,8 @@ def _fetch_chain(g, inst: str, expiry: str) -> dict | None:
         'pe_oi':          pe_oi,
         'ce_ltp':         ce_ltp,
         'pe_ltp':         pe_ltp,
+        'ce_vol':         ce_vol,
+        'pe_vol':         pe_vol,
     }
 
 
@@ -531,7 +650,9 @@ def _is_market_now() -> bool:
 
 def oneshot(g, instruments: list[str],
             prev_snaps: dict, states: dict, expiries: dict,
-            token: str, chats: list[str]) -> None:
+            token: str, chats: list[str],
+            oi_accum: dict | None = None,
+            last_oi_minute: dict | None = None) -> None:
     """Single poll cycle across all instruments."""
     for inst in instruments:
         if inst not in expiries:
@@ -540,6 +661,11 @@ def oneshot(g, instruments: list[str],
         chain = _fetch_chain(g, inst, expiries[inst])
         if chain is None:
             continue
+
+        # Capture per-minute OI before scoring — the seed-snapshot path below
+        # returns early, but the first minute's OI must still be recorded.
+        if oi_accum is not None and last_oi_minute is not None:
+            _accumulate_oi(inst, chain, oi_accum, last_oi_minute)
 
         prev = prev_snaps.get(inst)
         if prev is None:
@@ -597,8 +723,11 @@ def daemon() -> None:
     prev_snaps: dict[str, dict]  = {}
     states:     dict[str, dict]  = {}
     expiries:   dict[str, str]   = {}
+    oi_accum:       dict[str, dict] = {}   # {inst: {strike: {'CE':[...], 'PE':[...]}}}
+    last_oi_minute: dict[str, object] = {} # {inst: pd.Timestamp(minute)}
 
     last_heartbeat = time.time()
+    last_oi_persist = time.time()
     consecutive_failures = 0   # for backoff schedule
 
     while True:
@@ -606,6 +735,9 @@ def daemon() -> None:
             t = datetime.now(IST).time()
             if t > MARKET_CLOSE:
                 log.info("Market closed (>15:30 IST) — exiting")
+                # Final OI flush so the last minutes of the session land on disk.
+                for inst in INSTRUMENTS:
+                    _persist_option_oi(inst, oi_accum)
                 if ALERT_MODE == 'summary':
                     _send_eod_summary(states, token, chats)
                 _API_EXECUTOR.shutdown(wait=False)
@@ -626,7 +758,8 @@ def daemon() -> None:
         cycle_failed = False
         try:
             oneshot(g, list(INSTRUMENTS.keys()),
-                    prev_snaps, states, expiries, token, chats)
+                    prev_snaps, states, expiries, token, chats,
+                    oi_accum, last_oi_minute)
             # Reset failure counter on a clean cycle
             if consecutive_failures > 0:
                 log.info("Recovered after %d consecutive failures",
@@ -658,6 +791,13 @@ def daemon() -> None:
                          f"anomalies={int(s.get('anomaly_count', 0))} "
                          f"failures={consecutive_failures}")
             last_heartbeat = time.time()
+
+        # Persist per-minute OI to option_oi_1m_<INST>.pkl on a cadence so the
+        # viewer's option S&R walls stay fresh through the session.
+        if time.time() - last_oi_persist >= OI_PERSIST_SECS:
+            for inst in INSTRUMENTS:
+                _persist_option_oi(inst, oi_accum)
+            last_oi_persist = time.time()
 
         # Apply backoff schedule on consecutive failures
         sleep_secs = _backoff_sleep(consecutive_failures)
@@ -706,7 +846,11 @@ def main() -> None:
         g = _get_groww()
         token, chats = _telegram_macro()
         prev, states, exp = {}, {}, {}
-        oneshot(g, list(INSTRUMENTS.keys()), prev, states, exp, token, chats)
+        oi_accum, last_oi_minute = {}, {}
+        oneshot(g, list(INSTRUMENTS.keys()), prev, states, exp, token, chats,
+                oi_accum, last_oi_minute)
+        for inst in INSTRUMENTS:
+            _persist_option_oi(inst, oi_accum)
 
 
 if __name__ == '__main__':

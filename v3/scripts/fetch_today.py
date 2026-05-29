@@ -110,16 +110,21 @@ def fetch_option_oi_today(g, trade_date: date) -> dict:
         len(day_oi), non_empty
     )
 
-    # Write back into OI cache (force overwrite today's entry)
+    # Merge into the OI cache, never overwrite. get_historical_candles omits OI
+    # for a still-active contract (oi=0), so a blind same-day overwrite would
+    # wipe the real OI the option_flow_daemon/runners captured live from the
+    # option chain. merge_day_oi keeps real OI and only fills gaps.
+    from v3.data.oi_cache_merge import merge_day_oi
     oi_cache: dict = {}
     if OI_CACHE.exists():
         with open(OI_CACHE, 'rb') as fh:
             oi_cache = pickle.load(fh)
-    oi_cache[str(trade_date)] = day_oi
+    merged = merge_day_oi(oi_cache.get(str(trade_date)), day_oi)
+    oi_cache[str(trade_date)] = merged
     with open(OI_CACHE, 'wb') as fh:
         pickle.dump(oi_cache, fh)
-    log.info("Option OI cache updated → %s", OI_CACHE)
-    return day_oi
+    log.info("Option OI cache updated (merged) → %s", OI_CACHE)
+    return merged
 
 
 # ── Step 3: Fetch bhavcopy PCR for today ─────────────────────────────────────
