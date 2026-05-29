@@ -13,6 +13,7 @@
 │  GROWW_API_KEY / GROWW_TOTP_SECRET                                         │
 │  TELEGRAM_BOT_TOKEN          TELEGRAM_CHAT_IDS         (TRADE bot)         │
 │  TELEGRAM_BOT_TOKEN_MACRO    TELEGRAM_CHAT_IDS_MACRO   (MACRO bot)         │
+│  TELEGRAM_BOT_TOKEN_SANITY   TELEGRAM_CHAT_IDS_SANITY  (SANITY bot)        │
 └────────────────────────────────────────────────────────────────────────────┘
                                      │
        ┌─────────────────────────────┼──────────────────────────────┐
@@ -208,3 +209,86 @@ Before deploying real capital:
 The signal-daemon is best-effort: if Groww auth fails or the cache stops
 updating, it will silently emit nothing. A heartbeat alert (every hour
 "daemon alive, last bar = …") would close that gap.
+
+---
+
+## 8. Operational layer, viewer & 3-channel alerts (May 2026)
+
+Everything below was layered on after the initial backtest pass. The trade
+strategy stack (§2) is unchanged; this is the live-ops + analysis scaffolding.
+
+### 8.1 Three Telegram channels (strict classification)
+
+| Channel | Env token | Carries |
+|---|---|---|
+| **TRADE** | `TELEGRAM_BOT_TOKEN` | runner_nifty/banknifty, scanner, hero_zero, `vp_live_daemon`, `vp_paper_journal`, **`signal_validator`** (per-signal veto) |
+| **MACRO** | `TELEGRAM_BOT_TOKEN_MACRO` | `option_flow_daemon`, `news/dispatcher`, `morning_brief` — intelligence, not actions |
+| **SANITY** | `TELEGRAM_BOT_TOKEN_SANITY` | `monitor` watchdog, `healthcheck`, `autoheal`, tick-recorder watchdog — **fires only when something is wrong** |
+
+Senders fall back to MACRO if a token is unset. SANITY is deliberately
+low-noise: no heartbeats / all-green pings — only failures and auto-restarts.
+
+### 8.2 Ops automation (all macOS launchd + caffeinate)
+
+- **`ops/monitor.py`** — watchdog. Supervises 8 targets (viewer, recorders,
+  daemons), auto-restarts dead/stale ones, escalates to SANITY after
+  `MAX_RESTARTS_PER_HOUR`. Gated on `market_calendar.is_trading_day` + market
+  hours so it's silent on holidays/overnight. Long-running (KeepAlive) — must
+  be restarted to pick up code changes.
+- **`ops/autoheal.py`** (`com.hawala.autoheal`, 06:55 weekday) — runs
+  healthcheck, AUTO-FIXES safe failures (re-runs the stale fetcher),
+  re-verifies, escalates the rest to SANITY. Pings SANITY **only when
+  something needs a human**; skips silently on weekends/holidays.
+- **`ops/healthcheck.py`** (07:25) — detect-only. Caches/logs/PDF vs the
+  **last TRADING day** (`market_calendar`-aware; was weekday-only, which
+  false-flagged "data missing" the morning after a holiday). Alerts SANITY on
+  FAIL/WARN only. Verifies all 3 bots reachable.
+- **`ops/market_calendar.py`** + `ops/market_holidays.json` — the single
+  source of truth for "is the market open?". Used by monitor, healthcheck,
+  autoheal, and the viewer's date-aware logic.
+
+### 8.3 Data recorders
+
+- **`alerts/tick_recorder.py`** — per-tick footprint (NIFTY/BANKNIFTY/SENSEX
+  near-month **FUTURES**) → `v3/cache/ticks_<INST>_<DATE>.csv`.
+- **`alerts/spot_vix_recorder.py`** — 1-min INDEX spot + INDIAVIX. Reads
+  Groww's `ohlc{}` + `day_change/day_change_perc` (NOT `day_open`/
+  `previous_close`, which don't exist — that bug zeroed change_pct).
+- **`option_flow_daemon`** now persists real per-minute OI from
+  `get_option_chain` into `option_oi_1m_<INST>.pkl`. Historical-candle
+  fetchers omit OI for active contracts, so `oi_cache_merge.merge_day_oi()`
+  preserves live OI on every write (prevents the all-zero-OI bug that
+  silently disabled option walls).
+
+### 8.4 Live footprint viewer (`viewer/live_server.py` + `static/`)
+
+FastAPI on `localhost:8765`, Plotly front-end. **Dark theme.** Header shows
+the **index spot + live % change** (`/basis`, with last-close fallback) and a
+**contango chip** (futures − spot); the futures price rides a heartbeat pulse
+on the live candle tip. Panes: footprint candles, session BS-qty (net column),
+delta histogram, live DOM + session DOM profile.
+
+Key behaviours:
+- Levels: floor pivots (left), volume-profile POC/VAH/VAL/HVN (indented), and
+  option walls CE/PE/MaxPain (right, **basis-adjusted** onto the futures axis).
+  Hover any line → what-it-is tooltip.
+- **Date-aware** volume profile (replays show that day's prior-day profile,
+  from the persisted `candles_1m` history).
+- **Pre-market / no-tick view**: pivots + VP + option walls + last index spot
+  with a 09:00–09:15 timestamp; persists for older days.
+- Clean vs Analysis mode (experimental markers are study-only, never traded).
+- Discipline rule: the system (v3 runners / VP-Trail) is the ONLY trade
+  origination; the viewer + `signal_validator` validate/veto only.
+
+### 8.5 Newsletter (`run_daily_report.py` → `gen_html_report.py`)
+
+Daily PDF to MACRO at ~07:32. As of May 2026 it carries **market intelligence
+only** — the Healthcheck / Autoheal / Data-Freshness sections were removed
+(those live on the SANITY channel now).
+
+### 8.6 Gotcha: stale long-running daemons
+
+Code edits to `monitor`/`option_flow_daemon`/viewer do **not** take effect
+until the process is restarted (they hold old code in memory). After changing
+their `.py`, restart: kill + let the monitor respawn (market hours), or
+`launchctl kickstart -k gui/$(id -u)/com.hawala.monitor` for the monitor.

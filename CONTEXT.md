@@ -99,15 +99,16 @@ manual invocation.
 02:30 Sun   v3/scripts/weekly_backfill.sh → v3/cache/
 ```
 
-## 4. Two Telegram channels
+## 4. Three Telegram channels (May 2026)
 
 | Bot | Token env var | Used for |
 |---|---|---|
-| **TRADE** | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` | v3 entries/exits, news event alerts, weekly trade summary |
-| **MACRO** | `TELEGRAM_BOT_TOKEN_MACRO` + `TELEGRAM_CHAT_IDS_MACRO` | Daily newsletter PDF (07:32). NOTHING ELSE currently. |
+| **TRADE** | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` | v3 runners entries/exits, scanners, vp_live_daemon, vp_paper_journal, **signal_validator** (per-signal veto), news event alerts, weekly trade summary |
+| **MACRO** | `TELEGRAM_BOT_TOKEN_MACRO` + `TELEGRAM_CHAT_IDS_MACRO` | Daily newsletter PDF (07:32), option_flow_daemon intel, news/dispatcher, morning_brief — intelligence, not actions |
+| **SANITY** | `TELEGRAM_BOT_TOKEN_SANITY` + `TELEGRAM_CHAT_IDS_SANITY` | ops health: monitor watchdog, healthcheck, autoheal, tick-recorder watchdog — **fires ONLY when something is wrong** (no heartbeats) |
 
-`bots/macro_bot.py` exists with `--mode {premarket,midday,eod,daemon}` but is
-NOT cron-scheduled. If activated, briefs would also go to MACRO.
+Senders fall back to MACRO if a token is unset. The newsletter is now
+intelligence-only (Healthcheck/Autoheal/Data-Freshness sections removed → SANITY).
 
 ## 5. Directory map — where everything lives now
 
@@ -493,3 +494,25 @@ list, (2) restart `news.runner`, (3) note the removal in this section.
 - **Logs go in `logs/`.** Subdirected by which bot/process produced them.
 - **Don't add new strategies to `run_canonical.py` without re-running OOS.**
   The Notion strategy pages are the source of truth for params.
+
+## 11. Ops, viewer & 3-channel overhaul (May 2026) — see ARCHITECTURE.md §8
+
+Live-ops + analysis scaffolding layered on top of the (unchanged) strategy stack:
+
+- **3 Telegram channels** (§4): TRADE / MACRO / SANITY. SANITY = problems only.
+- **Ops automation (launchd):** `ops/monitor.py` (watchdog, market-gated,
+  long-running), `ops/autoheal.py` (com.hawala.autoheal 06:55 — auto-fix stale
+  caches, alert SANITY only when a human is needed, skip holidays),
+  `ops/healthcheck.py` (07:25, market_calendar-aware last-trading-day),
+  `ops/market_calendar.py` (is_trading_day — single source of truth).
+- **Recorders & data fixes:** ticks=FUTURES; spot_vix reads Groww `ohlc{}` +
+  `day_change_perc`; option_flow_daemon persists live per-minute OI +
+  `v3/data/oi_cache_merge.py` stops historical fetches zeroing it.
+- **Live viewer** (`viewer/live_server.py`, localhost:8765, dark theme):
+  index-spot header + live % + contango chip, candle-tip heartbeat,
+  date-aware volume profile, pre-market levels view, basis-adjusted option
+  walls, level hovers. The system is the ONLY trade origination; viewer +
+  signal_validator validate/veto only.
+- **GOTCHA:** monitor/option_flow/viewer hold old code until restarted after
+  a `.py` edit (`launchctl kickstart -k gui/$(id -u)/com.hawala.monitor`, or
+  kill+monitor-respawn during market hours).
