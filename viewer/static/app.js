@@ -322,25 +322,27 @@ async function fullReload () {
   state.ws_seq += 1;                            // invalidate any in-flight msgs
   if (state.resync_timer) { clearInterval(state.resync_timer); state.resync_timer = null; }
 
+  // These five endpoints are independent of one another, so fire them in
+  // PARALLEL instead of serially — an instrument switch otherwise waits for
+  // the SUM of all round-trips (snapshot + pivots + VP + option_levels +
+  // basis ≈ 1.1 s) before the first repaint. Parallel = the max single call.
   const q = new URLSearchParams({inst: state.inst, date: state.date,
                                  tf: state.tf, cell: state.cell_size});
-  state.snap = await fetch('/snapshot?' + q).then(r => r.json());
+  const pq = new URLSearchParams({inst: state.inst, date: state.date});
+  const [snap, pivots] = await Promise.all([
+    fetch('/snapshot?' + q).then(r => r.json()).catch(() => null),
+    fetch('/pivots?'   + pq).then(r => r.json()).catch(() => null),
+    // fetchVolProfile / fetchOptionLevels / fetchBasis set state.* internally;
+    // run them concurrently and don't block the two we destructure above.
+    fetchVolProfile().catch(() => {}),
+    fetchOptionLevels().catch(() => {}),
+    fetchBasis().catch(() => {}),
+  ]);
+  state.snap = snap || {};
   state.n_ticks = state.snap.n_ticks || 0;
   rebuildIndex();
-  // Pivots: prior-day classic floor pivots. Stable for the whole session —
-  // fetch once on reload.
-  try {
-    const pq = new URLSearchParams({inst: state.inst, date: state.date});
-    const pr = await fetch('/pivots?' + pq).then(r => r.json());
-    state.pivots = (pr && !pr.error) ? pr : null;
-  } catch (e) { state.pivots = null; }
-  // Composite volume profile (prior-day / weekly) — stable for the session,
-  // fetch once on reload. Re-fetched when the user toggles scope.
-  await fetchVolProfile();
-  // Option-OI S&R levels — these EVOLVE intraday, so also re-fetched by the
-  // 5s resync loop (see resyncRunningBucket) to track positioning shifts.
-  await fetchOptionLevels();
-  await fetchBasis();
+  // Pivots: prior-day classic floor pivots. Stable for the whole session.
+  state.pivots = (pivots && !pivots.error) ? pivots : null;
   redrawAll();
   setStatus(isReplay() ? `replay · ${state.date}` : 'live ✓');
   // Heartbeat: live by default; on a replay there's no ticking, so park it.

@@ -603,20 +603,39 @@ def _latest_true_spot(inst: str, day: str) -> tuple[Optional[float], int, Option
         return None, 0, None, None
 
 
-def _build_option_levels(inst: str, day: str) -> dict:
-    empty = {'inst': inst, 'available': False, 'reason': 'no data'}
+# ── OI-parse cache ────────────────────────────────────────────────────────
+# option_oi_1m_<inst>.pkl is large (NIFTY ~218 MB) and unpickling it on every
+# request cost ~1 s — multiplied by the 5 s resync loop AND every instrument
+# switch. The OI daemon only rewrites the file ~once a minute, so cache the
+# parsed {strike→latest-OI} result keyed on the file's mtime+size. A cache hit
+# is ~microseconds; we re-parse at most once per minute per instrument. The
+# live, per-tick parts (spot cutoff, basis) are still computed fresh downstream.
+_OI_PARSE_CACHE: dict = {}   # inst → (mtime, size, day_used, stale, ce_oi, pe_oi, latest_ms)
+
+
+def _parse_oi_store(inst: str, day: str):
+    """Return (day_used, stale, ce_oi, pe_oi, latest_ms) or None. Cached by the
+    pkl's (mtime, size) so the 218 MB unpickle happens ≤once/minute/instrument."""
     p = CACHE_DIR / f'option_oi_1m_{inst}.pkl'
     if not p.exists():
-        return empty
+        return None
+    try:
+        st = p.stat()
+        sig = (st.st_mtime, st.st_size)
+    except OSError:
+        return None
+    cached = _OI_PARSE_CACHE.get(inst)
+    # stored layout: (mtime, size, ce_oi, pe_oi, latest_ms, day_used, stale, day)
+    if cached and cached[0] == sig[0] and cached[1] == sig[1] and cached[7] == day:
+        return cached[5], cached[6], cached[2], cached[3], cached[4]
     try:
         store = pickle.load(open(p, 'rb'))
-    except Exception as e:
-        return {**empty, 'reason': f'load err: {e}'}
+    except Exception:
+        return None
     if day not in store or not store[day]:
-        # Fall back to the most recent cached day (flag as stale).
         days = sorted([d for d in store.keys() if store[d]])
         if not days:
-            return empty
+            return None
         day_used, stale = days[-1], (days[-1] != day)
     else:
         day_used, stale = day, False
@@ -643,35 +662,42 @@ def _build_option_levels(inst: str, day: str) -> dict:
                 latest_ms = max(latest_ms, int(pd.Timestamp(ts).timestamp() * 1000))
             except Exception:
                 pass
+    # Cache keyed on (mtime, size, day) — note `day` so a date switch re-parses.
+    _OI_PARSE_CACHE[inst] = (sig[0], sig[1], ce_oi, pe_oi, latest_ms,
+                             day_used, stale, day)
+    return day_used, stale, ce_oi, pe_oi, latest_ms
+
+
+def _build_option_levels(inst: str, day: str) -> dict:
+    empty = {'inst': inst, 'available': False, 'reason': 'no data'}
+    parsed = _parse_oi_store(inst, day)
+    if parsed is None:
+        return empty
+    day_used, stale, ce_oi, pe_oi, latest_ms = parsed
     if not ce_oi and not pe_oi:
         return {**empty, 'reason': 'no non-zero OI', 'day_used': day_used}
 
     # Spot reference for day_used — needed to filter out far-OTM round-strike
     # OI artifacts (e.g. a 60000 BANKNIFTY strike with huge OI when spot is
-    # 55000 is NOT support). Use that day's last 1m close; fall back to the
-    # OI-weighted strike midpoint.
-    spot = None
-    try:
-        cpath = CACHE_DIR / f'candles_1m_{inst}.pkl'
-        if cpath.exists():
-            cdf = pickle.load(open(cpath, 'rb'))
-            cdf = cdf[pd.to_datetime(cdf['ts']).dt.date == date.fromisoformat(day_used)]
-            if not cdf.empty:
-                spot = float(cdf['close'].iloc[-1])
-    except Exception:
-        spot = None
-    if spot is None:
+    # 55000 is NOT support). Strikes are INDEX-referenced, so the band +
+    # at/below(above) cutoffs MUST compare against the INDEX spot — NOT the
+    # futures close, which sits ~basis higher and would misclassify above-index
+    # strikes as "support". Prefer the live true index spot (cheap tail read);
+    # only fall back to the 5.6 MB candles unpickle if that's unavailable.
+    spot, _, _, _ = _latest_true_spot(inst, day_used)
+    if not spot:
+        try:
+            cpath = CACHE_DIR / f'candles_1m_{inst}.pkl'
+            if cpath.exists():
+                cdf = pickle.load(open(cpath, 'rb'))
+                cdf = cdf[pd.to_datetime(cdf['ts']).dt.date == date.fromisoformat(day_used)]
+                if not cdf.empty:
+                    spot = float(cdf['close'].iloc[-1])
+        except Exception:
+            spot = None
+    if not spot:
         allk = list(ce_oi) + list(pe_oi)
         spot = sum(allk) / len(allk) if allk else None
-
-    # Strikes are INDEX-referenced, so the band + at/below(above) cutoffs must
-    # compare against the INDEX spot — NOT the futures close, which sits ~basis
-    # higher and would misclassify above-index strikes (e.g. 24000 when the
-    # index is 23950) as "support". Plotting still adds the basis to map the
-    # chosen strike onto the futures axis (done client-side).
-    _idx, _, _, _ = _latest_true_spot(inst, day_used)
-    if _idx:
-        spot = _idx
 
     # Band = strikes within ±5% of spot (the liquid, meaningful S&R zone).
     def _in_band(k):
