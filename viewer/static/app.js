@@ -966,6 +966,12 @@ function redrawAll () {
   const closedC = sortedC.slice(0, nClosed);
   const bodies  = closedC.map(c => Math.abs(c.close - c.open));
   const medBody = bodies.slice().sort((a,b)=>a-b)[Math.floor(bodies.length/2)] || cs;
+  // Absorption is "big aggression but price DID NOT MOVE" — the correct measure
+  // of "didn't move" is the full RANGE (high−low), not the body (close−open). A
+  // bar can close flat after a wide intrabar swing (range ≫ body); that's churn
+  // /rejection, not absorption. Use median RANGE for the pinned-price test.
+  const ranges   = closedC.map(c => Math.max(c.high - c.low, 0));
+  const medRange = ranges.slice().sort((a,b)=>a-b)[Math.floor(ranges.length/2)] || cs;
   const deltas  = sortedC.map(c => c.delta_qty || 0);   // full — reversal uses i-1
   const absDeltas = closedC.map(c => Math.abs(c.delta_qty || 0)).sort((a,b)=>a-b);
   const p70Delta  = absDeltas[Math.floor(absDeltas.length*0.70)] || 0;
@@ -974,15 +980,18 @@ function redrawAll () {
   // Clean cockpit). Computations above stay so the entry-scorer can reuse them.
   for (let i = 0; state.analysis_mode && i < nClosed; i++) {
     const c = sortedC[i];
-    const body = Math.abs(c.close - c.open);
+    const rng  = Math.max(c.high - c.low, 0);
     const d    = c.delta_qty || 0;
-    // Absorption: delta in top-30% of the session AND body ≤ 60% of median.
-    if (Math.abs(d) >= p70Delta && p70Delta > 0 && body <= 0.6 * medBody) {
+    // Absorption: delta in the session top-30% AND the bar barely MOVED
+    // (range ≤ 60% of median range). Range, not body — a wide-swing bar that
+    // closes flat is rejection/churn, not absorption. (e.g. a +1195 Δ bar with
+    // a 34pt range is NOT absorption: price clearly travelled.)
+    if (Math.abs(d) >= p70Delta && p70Delta > 0 && rng <= 0.6 * medRange) {
       annos.push({
         x: c.bucket, y: c.high + 1.2*cs, xref:'x', yref:'y',
         text:'🅐', showarrow:false, font:{size:12},
-        hovertext:`Absorption — Δ=${fmtNum(d)} but body only ${body.toFixed(1)}pts. `
-                + `Aggression absorbed; level defended.`,
+        hovertext:`Absorption — Δ=${fmtNum(d)} but range only ${rng.toFixed(1)}pts `
+                + `(≤60% of median ${medRange.toFixed(1)}). Aggression absorbed; price pinned.`,
       });
     }
     // Reversal: delta flips sign vs prior bar, at a local extreme.
@@ -1262,7 +1271,10 @@ function redrawAll () {
       const d = c.delta_qty || 0;
       const lowerWick = Math.min(c.open, c.close) - c.low;
       const upperWick = c.high - Math.max(c.open, c.close);
-      const absorb = Math.abs(d) >= p70Delta && p70Delta > 0 && body <= 0.6*medBody;
+      // Absorption (+1 to score): high delta but price pinned — use RANGE, not
+      // body (a wide-swing bar that closes flat isn't absorbed). Matches the
+      // 🅐 badge definition.
+      const absorb = Math.abs(d) >= p70Delta && p70Delta > 0 && rng <= 0.6*medRange;
 
       // ── LONG: rejection of a support level ──
       let bestL = null, bestScore = 0;
