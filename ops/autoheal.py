@@ -177,6 +177,19 @@ def main() -> int:
 
     print(f"autoheal @ {NOW:%Y-%m-%d %H:%M:%S IST}  dry_run={args.dry_run}")
 
+    # ── Market-state guard ────────────────────────────────────────────────
+    # On a non-trading day (weekend/holiday) there's no fresh data to expect
+    # and the fixers (which re-run live fetchers) would just fail. Skip the
+    # whole routine silently — nothing is "wrong", so nothing to escalate.
+    try:
+        from ops.market_calendar import is_trading_day, holiday_reason
+        if not is_trading_day(TODAY):
+            why = holiday_reason(TODAY) or 'weekend'
+            print(f"  market closed today ({why}) — skipping autoheal, no alert")
+            return 0
+    except Exception as e:
+        print(f"  market_calendar unavailable ({e}) — proceeding")
+
     # ── Pass 1: detect ────────────────────────────────────────────────────
     hc1 = _run_healthcheck()
     checks1 = hc1.get('checks', [])
@@ -255,7 +268,9 @@ def main() -> int:
     # ── Notify ────────────────────────────────────────────────────────────
     n_fixed = len([f for f in fixed if not f.get('dry_run')])
     needs_human = failed_to_fix + unfixable
-    if needs_human or n_fixed:
+    # Low-noise sanity policy: only ping when something NEEDS A HUMAN. Pure
+    # successful auto-fixes are self-healed → logged to JSON/console, not pushed.
+    if needs_human:
         lines = [f"🔧 <b>HAWALA AUTOHEAL — {NOW:%d-%b %H:%M}</b>"]
         if n_fixed:
             lines.append(f"\n<b>Auto-fixed ({n_fixed}):</b>")

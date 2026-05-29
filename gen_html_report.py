@@ -1281,8 +1281,6 @@ def build_html(data: dict) -> str:
 
 <div class="container">
 
-{_healthcheck_block()}
-
 {macro_alert}
 
 {_snap_cards(data)}
@@ -1317,8 +1315,6 @@ def build_html(data: dict) -> str:
 {_news_section(data)}
 
 {_events_calendar(data)}
-
-{_data_freshness_section(data)}
 
 </div>
 
