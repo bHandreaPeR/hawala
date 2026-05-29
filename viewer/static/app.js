@@ -953,15 +953,24 @@ function redrawAll () {
   //   of an up-run or low of a down-run). Marker: ⤣ arrow at the turn.
   // Both computed from data already in the snapshot — no new capture.
   const sortedC = candles;   // already bucket-sorted
-  const bodies  = sortedC.map(c => Math.abs(c.close - c.open));
+  // The last bucket is still FORMING when live — its delta/body grow with every
+  // tick. Including it in the session baselines (median body, 70th-pctile delta)
+  // makes those thresholds wobble each tick, so a borderline PAST candle
+  // (|delta| ≈ p70) keeps flipping in/out of "absorption" and the 🅐 marker
+  // flickers. Compute the baselines over COMPLETED candles only, and don't
+  // badge the in-progress bar (its stats aren't final yet anyway).
+  const nClosed = (isReplay() || sortedC.length < 2)
+                  ? sortedC.length : sortedC.length - 1;
+  const closedC = sortedC.slice(0, nClosed);
+  const bodies  = closedC.map(c => Math.abs(c.close - c.open));
   const medBody = bodies.slice().sort((a,b)=>a-b)[Math.floor(bodies.length/2)] || cs;
-  const deltas  = sortedC.map(c => c.delta_qty || 0);
-  const absDeltas = deltas.map(Math.abs).sort((a,b)=>a-b);
+  const deltas  = sortedC.map(c => c.delta_qty || 0);   // full — reversal uses i-1
+  const absDeltas = closedC.map(c => Math.abs(c.delta_qty || 0)).sort((a,b)=>a-b);
   const p70Delta  = absDeltas[Math.floor(absDeltas.length*0.70)] || 0;
 
   // Experimental badges only in Analysis mode (kept off the disciplined
   // Clean cockpit). Computations above stay so the entry-scorer can reuse them.
-  for (let i = 0; state.analysis_mode && i < sortedC.length; i++) {
+  for (let i = 0; state.analysis_mode && i < nClosed; i++) {
     const c = sortedC[i];
     const body = Math.abs(c.close - c.open);
     const d    = c.delta_qty || 0;
@@ -1238,7 +1247,10 @@ function redrawAll () {
       Math.abs(dc.cell - px) <= tol &&
       (side === 'bid' ? dc.bid_persistence : dc.ask_persistence) >= 0.30);
 
-    for (let i = 0; i < candles.length; i++) {
+    // Only score COMPLETED candles (nClosed) — the in-progress bar's delta /
+    // body / level-touch aren't final, so scoring it produces a marker that
+    // flickers on each tick. Same baseline-stability reasoning as the badges.
+    for (let i = 0; i < nClosed; i++) {
       const c = candles[i];
       const rng = Math.max(c.high - c.low, 1e-6);
       const body = Math.abs(c.close - c.open);
