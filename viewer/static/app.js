@@ -1433,41 +1433,75 @@ function redrawAll () {
   }
   const prof = [...profByCell.values()].sort((a,b) => a.cell - b.cell);
   const profUseQty = prof.some(p => p.buy_qty > 0 || p.sell_qty > 0);
-  const profBuy  = prof.map(p => profUseQty ? p.buy_qty  : p.buy_ticks);
-  const profSell = prof.map(p => profUseQty ? -p.sell_qty : -p.sell_ticks);
+  // STACKED layout: sell segment [0 → sell] then buy segment [sell → sell+buy].
+  // Both magnitudes are POSITIVE; the buy trace uses `base = profSell` to stack
+  // on top. Total bar length = volume; net (buy−sell) shown as a label column.
+  const profSell = prof.map(p => profUseQty ? p.sell_qty : p.sell_ticks);   // +
+  const profBuy  = prof.map(p => profUseQty ? p.buy_qty  : p.buy_ticks);    // +
   const profY    = prof.map(p => p.cell);
-  // Per-level buy/sell numbers (both sides) + an OVERALL total per level.
-  const profSellLabels = prof.map(p => fmtNum(profUseQty ? p.sell_qty : p.sell_ticks));
-  const profBuyLabels  = prof.map(p => fmtNum(profUseQty ? p.buy_qty  : p.buy_ticks));
-  const profNet = prof.map(p => profUseQty ? (p.buy_qty - p.sell_qty)
-                                           : (p.buy_ticks - p.sell_ticks));
-  const profVol = prof.map(p => profUseQty ? (p.buy_qty + p.sell_qty)
-                                           : (p.buy_ticks + p.sell_ticks));
-  // x2 axis bound — right-anchors the NET column inside the BS pane.
-  const _profMax = Math.max(1, ...profBuy, ...profSell.map(Math.abs));
-  const prof2Max = _profMax * 1.15;
+  // Per-segment labels (blank when 0 so we don't print "0" inside thin bars).
+  const profSellLabels = profSell.map(v => v > 0 ? fmtNum(v) : '');
+  const profBuyLabels  = profBuy.map(v  => v > 0 ? fmtNum(v) : '');
+  const profNet = prof.map((p, i) => profBuy[i] - profSell[i]);
+  const profVol = prof.map((p, i) => profBuy[i] + profSell[i]);
+  // x2 bound — fit the stacked total + a right-hand column for the net label.
+  const _profMax = Math.max(1, ...profVol);
+  const prof2Max = _profMax * 1.28;
   // NET (buy − sell) per price level — signed + colour-coded, right column.
   prof.forEach((p, i) => {
     if (profVol[i] <= 0) return;
     const net = profNet[i];
     const sign = net > 0 ? '+' : net < 0 ? '−' : '';
     annos.push({
-      x: prof2Max * 0.98, y: p.cell, xref:'x2', yref:'y2',
+      x: prof2Max * 0.99, y: p.cell, xref:'x2', yref:'y2',
       text: `<b>${sign}${fmtNum(Math.abs(net))}</b>`, showarrow:false,
       xanchor:'right', yanchor:'middle',
       font:{size:7, color: net > 0 ? '#3fd6c4' : net < 0 ? '#ff7b72' : '#8a93a0'},
     });
   });
 
-  // Bottom-pane delta histogram
+  // Bottom-pane: STACKED buy+sell per TIME bucket — same structure as the
+  // price-based BS pane, but over time. sell segment [0 → sell], buy stacked
+  // on top [sell → sell+buy]; net (Δ) labeled above each column. Buy/sell are
+  // aggregated per bucket from the footprint cells (candles only carry net Δ).
   const dx = candles.map(k => k.bucket);
-  const dy = candles.map(k => k.delta_qty);
-  const dcol = dy.map(v => v >= 0 ? '#26a69a' : '#ef5350');
+  const bsByBucket = new Map();
+  for (const c of cells) {
+    const b = bsByBucket.get(c.bucket) || {buy:0, sell:0, bt:0, st:0};
+    b.buy += c.buy_qty; b.sell += c.sell_qty;
+    b.bt  += c.buy_ticks; b.st += c.sell_ticks;
+    bsByBucket.set(c.bucket, b);
+  }
+  const dUseQty = [...bsByBucket.values()].some(b => b.buy > 0 || b.sell > 0);
+  const dSell = candles.map(k => { const b = bsByBucket.get(k.bucket);
+    return b ? (dUseQty ? b.sell : b.st) : 0; });
+  const dBuy  = candles.map(k => { const b = bsByBucket.get(k.bucket);
+    return b ? (dUseQty ? b.buy : b.bt) : 0; });
+  const dNet   = candles.map((k, i) => dBuy[i] - dSell[i]);
+  const dTotal = candles.map((k, i) => dBuy[i] + dSell[i]);
+  const dSellLabels = dSell.map(v => v > 0 ? fmtNum(v) : '');
+  const dBuyLabels  = dBuy.map(v  => v > 0 ? fmtNum(v) : '');
+  const dMaxTot = Math.max(1, ...dTotal);
 
   // Stride x-tick labels so a dense tf stays readable. When zoomed in to ≤20
   // candles we label every one.
   let xLabelStride = X_TICK_LABEL_EVERY[state.tf] || 1;
   if (visCandles <= 20) xLabelStride = 1;
+
+  // NET (Δ = buy − sell) label above each stacked column in the Δ-qty pane.
+  // Strided on dense timeframes so the small pane doesn't overcrowd.
+  candles.forEach((k, i) => {
+    if (dTotal[i] <= 0) return;
+    if (xLabelStride > 1 && (i % xLabelStride !== 0)) return;
+    const net = dNet[i];
+    const sign = net > 0 ? '+' : net < 0 ? '−' : '';
+    annos.push({
+      x: k.bucket, y: dTotal[i] + dMaxTot * 0.04, xref:'x3', yref:'y3',
+      text: `${sign}${fmtNum(Math.abs(net))}`, showarrow:false,
+      xanchor:'center', yanchor:'bottom',
+      font:{size:8, color: net > 0 ? '#3fd6c4' : net < 0 ? '#ff7b72' : '#8a93a0'},
+    });
+  });
 
   // ── Range + uirevision: make manual zoom/pan STICK ────────────────────
   // Plotly preserves user zoom/pan across redraws iff `uirevision` is
@@ -1512,8 +1546,9 @@ function redrawAll () {
     xaxis3: {type:'date', domain:[0, 0.72], anchor:'y3', matches:'x',
              tickformat:'%H:%M', gridcolor:GRID,
              showticklabels:true, tickfont:{size:9}},
-    yaxis3: {domain:[0, 0.18], title:'Δ qty', gridcolor:GRID,
+    yaxis3: {domain:[0, 0.18], title:'BS·Δ qty', gridcolor:GRID,
              tickfont:{size:9}, nticks:4, zeroline:true,
+             range:[0, dMaxTot * 1.18],
              zerolinecolor:'rgba(255,255,255,0.18)'},
     // Live DOM + session profile pane — more vertical gridlines.
     xaxis4: {domain:[0.86, 1.0], anchor:'y4', title:'DOM (live + session)',
@@ -1538,30 +1573,34 @@ function redrawAll () {
         Math.max(...candles.map(c=>c.high)) + 1.5*cs],
      mode:'markers', marker:{size:0.1, color:'rgba(0,0,0,0)'},
      hoverinfo:'skip', xaxis:'x', yaxis:'y'},
-    // session profile (pane #2) — sell side (left of axis, negative x)
-    {x: profSell, y: profY, type:'bar', orientation:'h',
+    // session profile (pane #2) — STACKED: sell segment [0 → sell]
+    {x: profSell, y: profY, type:'bar', orientation:'h', base: 0,
      xaxis:'x2', yaxis:'y2',
      marker:{color:'rgba(239,83,80,0.85)'},
      text: profSellLabels,
-     textposition:'inside', insidetextanchor:'end', cliponaxis:false,
-     textfont:{size:9, color:'#fff'},
+     textposition:'inside', insidetextanchor:'middle', cliponaxis:false,
+     textfont:{size:8, color:'#fff'},
      hovertemplate:'price=%{y}<br>sell=%{x:.0f}<extra></extra>'},
-    // session profile (pane #2) — buy side (right of axis, positive x)
-    {x: profBuy,  y: profY, type:'bar', orientation:'h',
+    // session profile (pane #2) — buy segment stacked on top [sell → sell+buy]
+    {x: profBuy,  y: profY, type:'bar', orientation:'h', base: profSell,
      xaxis:'x2', yaxis:'y2',
      marker:{color:'rgba(38,166,154,0.85)'},
      text: profBuyLabels,
-     textposition:'inside', insidetextanchor:'start', cliponaxis:false,
-     textfont:{size:9, color:'#fff'},
+     textposition:'inside', insidetextanchor:'middle', cliponaxis:false,
+     textfont:{size:8, color:'#fff'},
      hovertemplate:'price=%{y}<br>buy=%{x:.0f}<extra></extra>'},
-    // delta histogram (bottom pane) — numeric labels on top of positive bars,
-    // bottom of negative bars (Plotly's 'outside' handles this automatically).
-    {x: dx, y: dy, type:'bar', marker:{color: dcol},
-     xaxis:'x3', yaxis:'y3',
-     text: dy.map(v => fmtNum(Math.abs(v))),
-     textposition:'outside', cliponaxis:false,
-     textfont:{size:9, color:'#aeb6c2'},
-     hovertemplate:'%{x}<br>Δ=%{y:.0f}<extra></extra>'},
+    // Δ-qty pane (bottom) — STACKED sell [0→sell] + buy [sell→sell+buy] per
+    // time bucket; net Δ labeled above each column via annotations (above).
+    {x: dx, y: dSell, type:'bar', base: 0, xaxis:'x3', yaxis:'y3',
+     marker:{color:'rgba(239,83,80,0.85)'},
+     text: dSellLabels, textposition:'inside', insidetextanchor:'middle',
+     cliponaxis:false, textfont:{size:8, color:'#fff'},
+     hovertemplate:'%{x}<br>sell=%{y:.0f}<extra></extra>'},
+    {x: dx, y: dBuy, type:'bar', base: dSell, xaxis:'x3', yaxis:'y3',
+     marker:{color:'rgba(38,166,154,0.85)'},
+     text: dBuyLabels, textposition:'inside', insidetextanchor:'middle',
+     cliponaxis:false, textfont:{size:8, color:'#fff'},
+     hovertemplate:'%{x}<br>buy=%{y:.0f}<extra></extra>'},
     // ─ Session DOM profile (drawn FIRST so live top-5 lands on top) ──────
     // Faint full-day mean resting qty bars. Top-3 walls each side get
     // outlines + qty labels so genuine liquidity nodes are obvious.
