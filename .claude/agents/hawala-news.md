@@ -14,9 +14,25 @@ Moneycontrol, 0.7 CNBC/BBC/NYT/ET/Livemint/NDTV, 0.5 Google-News rates+geopoliti
 `score = direction × magnitude × tier × decay`, `confidence = magnitude × tier ×
 keyword_density`) → `normalize.py` (event_key + ANCHOR_TOKENS gate) → `dedup.py`
 (cluster) → `aggregator.py` (`aggregate_global` → `global_agg`) → `dispatcher.py`:
-`update_signal_file()` writes `v3/cache/news_signal.json` (viewer reads via
-`_positioning_macro`: MACRO value = clamp(score×conf, ±1)) AND `maybe_alert()`
-fires the MACRO Telegram. `digest.py` bundles capped/sub-threshold items → EOD.
+`update_signal_file(global_agg, sentiment=...)` writes `v3/cache/news_signal.json`
+AND `maybe_alert()` fires the MACRO Telegram. `digest.py` bundles capped/sub-
+threshold items → EOD.
+
+## TWO signals — pulse vs sentiment (don't confuse them)
+The scorer's recency decay is a **3-min half-life** (`RECENCY_HALF_LIFE_MIN=3`).
+That's the **PULSE** (`score`/`confidence` in news_signal.json + in-process
+`global_agg`) → drives ALERTS (fire when something just broke). It whipsaws by
+design and is NOT a mood gauge.
+The **viewer MACRO card** instead uses a **rolling 24h SENTIMENT** (`news/
+sentiment.py`): a tiny append-only log of ONLY scored items, aggregated over the
+last `NEWS_SENTIMENT_WINDOW_H=24`h with a `NEWS_SENTIMENT_HALFLIFE_H=6`h half-life
+(exp decay = continuous EMA → recency bias). `sentiment_score = Σ(s·w)/Σ(|s|·w)`
+∈[-1,1]; `sentiment_confidence = min(1, Σ|s|·w / NEWS_SENTIMENT_SAT)`. Written as
+`sentiment_*` fields; the viewer uses `sentiment_score×sentiment_confidence`
+(`basis:sentiment24h`), falling back to the pulse only if absent. A dedicated log
+is required because the cluster store is pruned at `CLUSTER_TTL_MIN=90`m.
+RULE: keep the pulse short (alerts need freshness); tune the CARD via the
+`NEWS_SENTIMENT_*` env vars, never by lengthening the alert half-life.
 
 ## Runtime (24/7)
 `news/runner.py` runs continuously via `com.hawala.news_runner` (KeepAlive,

@@ -35,6 +35,13 @@ originator.
   session + price range shows at zoom 1. Manual zoom/pan must STICK (uirevision +
   applyRange only on follow/force_range).
 
+## Positioning sidebar
+FLOW (footprint CVD) / RESTING (DOM imbalance) / INST (option-flow) / MACRO /
+COMPOSITE. The **MACRO card = rolling 24h news SENTIMENT** (`_positioning_macro`
+reads `sentiment_score×sentiment_confidence`, `basis:sentiment24h`), NOT the
+3-min alert pulse — owned by the hawala-news domain. The whole panel is
+unvalidated → study/veto only; on replay it shows N/A (news doesn't time-travel).
+
 ## Discipline (critical)
 - Clean mode = candles + validated levels + positioning. Analysis mode adds
   EXPERIMENTAL overlays (scored ▲▼ entries, absorption/reversal, HVN/LVN) that are

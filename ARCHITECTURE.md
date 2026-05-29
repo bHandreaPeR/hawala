@@ -312,3 +312,13 @@ from double-running. Alert caps (score≥0.60, conf≥0.70, ≤4/hr, ≤12/day,
 
 > Migration: remove the old `0 9 * * 1-5 … -m news.runner` crontab line —
 > the launchd agent supersedes it (the singleton guard makes it safe regardless).
+
+**Two signals — pulse vs sentiment.** The scorer's recency decay is a 3-min
+half-life: that's the **PULSE** (`score`/`confidence`) → drives ALERTS (fire on
+breaking news); it whipsaws by design. The viewer's **MACRO card** instead uses
+a **rolling 24h SENTIMENT** (`news/sentiment.py`): an append-only log of only
+scored items, aggregated over 24h with a ~6h half-life (exp decay = EMA-style
+recency bias), written as `sentiment_*` fields. The viewer uses
+`sentiment_score×sentiment_confidence` (`basis:sentiment24h`). Tune the card via
+`NEWS_SENTIMENT_WINDOW_H`/`HALFLIFE_H`/`SAT` — never by changing the alert
+half-life. A dedicated log is needed because the cluster store prunes at 90 min.

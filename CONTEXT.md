@@ -517,8 +517,12 @@ Live-ops + analysis scaffolding layered on top of the (unchanged) strategy stack
   a `.py` edit (`launchctl kickstart -k gui/$(id -u)/com.hawala.monitor`, or
   kill+monitor-respawn during market hours).
 - **News runs 24/7** (`com.hawala.news_runner`, KeepAlive, `--always`,
-  `NEWS_CYCLE_SEC=60`): the viewer MACRO card + skynet news alerts are the
-  same pipeline and now stay fresh round the clock (off-hours US/geopolitical
-  news). EOD digest still fires at the real 15:30 close; singleton guard +
-  alert caps prevent double-run and off-hours spam. **Remove the old
-  `0 9 * * 1-5 … news.runner` cron line** — the agent supersedes it.
+  `NEWS_CYCLE_SEC=60`): pipeline scores round the clock (off-hours
+  US/geopolitical news). EOD digest still fires at the real 15:30 close;
+  singleton guard + alert caps prevent double-run and off-hours spam. **Remove
+  the old `0 9 * * 1-5 … news.runner` cron line** — the agent supersedes it.
+- **News = TWO signals.** PULSE (3-min half-life `score`/`confidence`) → drives
+  ALERTS (skynet), whipsaws by design. The viewer MACRO card uses a ROLLING 24h
+  SENTIMENT (`news/sentiment.py`, ~6h half-life EMA-style decay, `sentiment_*`
+  fields, `basis:sentiment24h`). Tune the card via `NEWS_SENTIMENT_*` env vars,
+  not the alert half-life.
