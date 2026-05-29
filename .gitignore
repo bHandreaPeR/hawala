@@ -53,6 +53,7 @@ alerts/.*.json
 news/state/*.json
 news/*.pid
 news/state/*.pid
+viewer/state/
 
 # ── OS / Editor ────────────────────────────────────────────────
 .DS_Store

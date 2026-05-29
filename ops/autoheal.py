@@ -190,6 +190,28 @@ def main() -> int:
     except Exception as e:
         print(f"  market_calendar unavailable ({e}) — proceeding")
 
+    # ── Monthly futures-rollover pivot fix ────────────────────────────────
+    # Cheap on non-rollover days (only a cached get_expiries lookup, no
+    # historical fetch). On the first session of a new front month it writes
+    # an override so the viewer's floor pivots use the NEW contract's prior-day
+    # OHLC instead of the expiring one (~basis off). Best-effort: never block
+    # the rest of autoheal. One Groww auth, reused across instruments.
+    if not args.dry_run:
+        try:
+            from viewer.pivot_rollover import (maybe_backfill, INSTRUMENT_META,
+                                               _get_groww as _roll_groww)
+            groww = _roll_groww()
+            for inst in INSTRUMENT_META:
+                try:
+                    res = maybe_backfill(inst, TODAY, groww=groww)
+                    if res is not None:
+                        print(f"  rollover override [{inst}]: "
+                              f"{res['contract']} prior={res['prior_day']}")
+                except Exception as ie:
+                    print(f"  rollover check [{inst}] error: {ie}")
+        except Exception as e:
+            print(f"  pivot_rollover unavailable ({e}) — skipping")
+
     # ── Pass 1: detect ────────────────────────────────────────────────────
     hc1 = _run_healthcheck()
     checks1 = hc1.get('checks', [])

@@ -993,6 +993,20 @@ def _prior_day_ohlc(inst: str, today: date) -> Optional[dict]:
     if not days:
         return None
     prior = days[-1]
+
+    # Rollover guard: on the first session of a new front-month contract the
+    # cached `prior` row belongs to the OLD (expiring) contract, ~basis lower.
+    # pivot_rollover.maybe_backfill (run by autoheal at 06:55) writes an
+    # override with the NEW contract's prior-session OHLC. Prefer it when its
+    # prior_day matches — pure file read, no network. See viewer/pivot_rollover.
+    try:
+        from viewer.pivot_rollover import load_override
+        ov = load_override(inst, prior)
+        if ov:
+            return ov
+    except Exception:
+        pass
+
     sub = df[df['date'] == prior]
     if sub.empty:
         return None
