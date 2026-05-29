@@ -81,8 +81,14 @@ def _tg(msg: str):
                 k, _, v = ln.strip().partition('='); env[k] = v
     except Exception:
         return
-    tok = (env.get('TELEGRAM_BOT_TOKEN_TRADE') or env.get('TELEGRAM_BOT_TOKEN_MACRO') or '').strip()
+    # Per-signal veto rides alongside the runner's trade alert → TRADE channel.
+    # (Was TELEGRAM_BOT_TOKEN_TRADE — a key that doesn't exist — so it silently
+    # fell back to MACRO/skynet. The real trade bot is TELEGRAM_BOT_TOKEN.)
+    tok = (env.get('TELEGRAM_BOT_TOKEN_TRADE')
+           or env.get('TELEGRAM_BOT_TOKEN')
+           or env.get('TELEGRAM_BOT_TOKEN_MACRO') or '').strip()
     chats = [c.strip() for c in (env.get('TELEGRAM_CHAT_IDS_TRADE')
+             or env.get('TELEGRAM_CHAT_IDS')
              or env.get('TELEGRAM_CHAT_IDS_MACRO') or '').split(',') if c.strip()]
     if not tok or not chats:
         log.warning('no telegram creds'); return

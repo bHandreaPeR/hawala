@@ -337,10 +337,13 @@ def check_creds(checks: list) -> None:
     # Try Telegram getMe on both bots (lightweight)
     import urllib.request
     for var, label in [('TELEGRAM_BOT_TOKEN', 'TRADE bot reachable'),
-                        ('TELEGRAM_BOT_TOKEN_MACRO', 'MACRO bot reachable')]:
+                        ('TELEGRAM_BOT_TOKEN_MACRO', 'MACRO bot reachable'),
+                        ('TELEGRAM_BOT_TOKEN_SANITY', 'SANITY bot reachable')]:
         tok = env.get(var, '')
         if not tok:
-            _chk(checks, 'creds', label, 'FAIL', 'token missing'); continue
+            # SANITY is optional — only WARN if it's not configured.
+            sev = 'WARN' if var.endswith('_SANITY') else 'FAIL'
+            _chk(checks, 'creds', label, sev, 'token missing'); continue
         try:
             req = urllib.request.Request(f'https://api.telegram.org/bot{tok}/getMe',
                                           headers={'User-Agent':'hawala-healthcheck'})
