@@ -39,10 +39,10 @@ ROOT      = pathlib.Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / 'v3' / 'cache'
 STATIC    = pathlib.Path(__file__).resolve().parent / 'static'
 
-INSTRUMENTS = ['NIFTY', 'BANKNIFTY']
-DEFAULT_CELL = {'NIFTY': 5.0, 'BANKNIFTY': 10.0}
+INSTRUMENTS = ['NIFTY', 'BANKNIFTY', 'SENSEX']
+DEFAULT_CELL = {'NIFTY': 5.0, 'BANKNIFTY': 10.0, 'SENSEX': 20.0}
 TF_CHOICES   = ['1min', '3min', '5min', '15min']
-CELL_CHOICES = {'NIFTY': [2, 5, 10], 'BANKNIFTY': [5, 10, 20]}
+CELL_CHOICES = {'NIFTY': [2, 5, 10], 'BANKNIFTY': [5, 10, 20], 'SENSEX': [10, 20, 50]}
 
 IMB_MULT, IMB_MIN_TICKS, VA_PCT = 3.0, 4, 0.70
 
@@ -506,7 +506,8 @@ def _classify_profile(prof: dict, cs: float) -> dict:
     }
 
 
-def _build_volume_profile(inst: str, scope: str, cell_size: float) -> dict:
+def _build_volume_profile(inst: str, scope: str, cell_size: float,
+                          ref_date: Optional[date] = None) -> dict:
     path = CACHE_DIR / f'candles_1m_{inst}.pkl'
     empty = {'inst': inst, 'scope': scope, 'cells': [], 'poc': None,
              'vah': None, 'val': None, 'hvn': [], 'lvn': [],
@@ -523,7 +524,10 @@ def _build_volume_profile(inst: str, scope: str, cell_size: float) -> dict:
     df['d'] = pd.to_datetime(df['ts']).dt.date
 
     n = 1 if scope == 'prior_day' else 5
-    days = _prior_trading_days(n)
+    # Date-aware: the profile reflects the trading day(s) BEFORE ref_date, so a
+    # replay of an old date shows THAT date's prior-day profile (computed from
+    # the persisted candles_1m history), not today's.
+    days = _prior_trading_days(n, before=ref_date)
     sub = df[df['d'].isin(days)]
     if sub.empty:
         return empty
@@ -555,6 +559,39 @@ def _build_volume_profile(inst: str, scope: str, cell_size: float) -> dict:
 #   CE-OI resistance  = strike with highest call OI (writers defend above)
 #   Max Pain          = strike minimising total writer payout (expiry magnet)
 #   OI walls          = top strikes by CE / PE OI
+def _latest_true_spot(inst: str, day: str) -> tuple[Optional[float], int, Optional[float], Optional[float]]:
+    """Latest TRUE index spot (not futures) from the spot recorder file
+    spot_<INST>_<DATE>.csv. Returns (ltp, ts_ms, change_pts, change_pct).
+    Used for the header index quote AND the futures→spot basis. All-None if
+    unavailable."""
+    p = CACHE_DIR / f'spot_{inst}_{day.replace("-","")}.csv'
+    # Fallback: if the requested day's file is missing/empty (e.g. pre-open
+    # before the recorder has written today, or an old day we didn't record),
+    # use the most recent PRIOR spot file so the header still shows the last
+    # known close. We never use a file dated AFTER the requested day.
+    if not p.exists() or p.stat().st_size < 20:
+        want = day.replace('-', '')
+        cands = sorted(f for f in CACHE_DIR.glob(f'spot_{inst}_*.csv')
+                       if f.stem.split('_')[-1] <= want)
+        if not cands:
+            return None, 0, None, None
+        p = cands[-1]
+    try:
+        size = p.stat().st_size
+        with p.open('rb') as f:
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode('utf-8', errors='ignore')
+        rows = [ln for ln in tail.splitlines() if ln and ln[0].isdigit()]
+        if not rows:
+            return None, 0, None, None
+        last = rows[-1].split(',')   # ts_ms,ltp,change,change_pct,open,high,low
+        chg = float(last[2]) if len(last) > 2 and last[2] not in ('', '0.0', '0') else None
+        pct = float(last[3]) if len(last) > 3 and last[3] not in ('', '0.0', '0') else None
+        return float(last[1]), int(last[0]), chg, pct
+    except Exception:
+        return None, 0, None, None
+
+
 def _build_option_levels(inst: str, day: str) -> dict:
     empty = {'inst': inst, 'available': False, 'reason': 'no data'}
     p = CACHE_DIR / f'option_oi_1m_{inst}.pkl'
@@ -646,12 +683,35 @@ def _build_option_levels(inst: str, day: str) -> dict:
                 sorted(d.items(), key=lambda kv: -kv[1])[:n]]
 
     pcr = round(sum(pe_oi.values()) / sum(ce_oi.values()), 3) if ce_oi else None
+
+    # ── Futures→spot basis (contango) ─────────────────────────────────────
+    # The chart is near-month FUTURES; option strikes are SPOT-index levels.
+    # basis = futures − true_spot. Mapping a strike onto the futures chart =
+    # strike + basis. Only trust the basis when the true spot is FRESH (≤10 min
+    # old) and the basis is SANE (≤1.2% of price) — otherwise None and the
+    # client plots at the raw strike with a "basis n/a" note.
+    fut = _latest_ltp_from_ticks(inst, day)
+    true_spot, spot_ts, _spot_chg, _spot_pct = _latest_true_spot(inst, day)
+    basis = None
+    basis_fresh = False
+    if fut and true_spot:
+        spot_age_s = (datetime.now().timestamp() * 1000 - spot_ts) / 1000.0
+        b = fut - true_spot
+        basis_fresh = (0 <= spot_age_s <= 600) if spot_ts else False
+        if abs(b) <= 0.012 * fut:
+            basis = round(b, 1)
+
     return {
         'inst': inst, 'available': True, 'stale': stale, 'day_used': day_used,
         'updated_ms': latest_ms, 'spot_ref': round(spot, 1) if spot else None,
         'ce_resistance': ce_res, 'pe_support': pe_sup, 'max_pain': max_pain,
         'pcr_oi': pcr,
         'ce_walls': _top(ce_band), 'pe_walls': _top(pe_band),
+        # Basis fields: futures last, true spot, and the (guarded) basis to add
+        # to each spot-strike so it lands at the right futures level.
+        'fut_ref': round(fut, 1) if fut else None,
+        'true_spot': round(true_spot, 1) if true_spot else None,
+        'basis': basis, 'basis_fresh': basis_fresh,
     }
 
 
@@ -663,16 +723,84 @@ async def option_levels(inst: str = Query(...), date: Optional[str] = None):
     return JSONResponse(_build_option_levels(inst, day))
 
 
+def _futures_daily(inst: str, day: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """From candles_1m (futures), for the most recent trading day on/at-or-before
+    `day`: return (last_close, daily_change, daily_pct). Used as a pre-open /
+    no-tick fallback for the futures price + the last session's % move."""
+    path = CACHE_DIR / f'candles_1m_{inst}.pkl'
+    if not path.exists():
+        return None, None, None
+    try:
+        df = pickle.load(open(path, 'rb')).copy()
+        df['d'] = pd.to_datetime(df['ts']).dt.date
+        want = date.fromisoformat(day)
+        days = sorted(d for d in df['d'].unique() if d <= want)
+        if not days:
+            return None, None, None
+        last_close = float(df[df['d'] == days[-1]]['close'].iloc[-1])
+        if len(days) >= 2:
+            prev_close = float(df[df['d'] == days[-2]]['close'].iloc[-1])
+            if prev_close:
+                chg = last_close - prev_close
+                return last_close, round(chg, 2), round(chg / prev_close * 100, 4)
+        return last_close, None, None
+    except Exception:
+        return None, None, None
+
+
+@app.get('/basis')
+async def basis_ep(inst: str = Query(...), date: Optional[str] = None):
+    """Live futures→spot basis (contango): futures last tick − true index spot.
+    Independent of the option-OI cache so the header can always show it.
+    Pre-open / no-tick: falls back to the last session's futures close (for the
+    basis) and the last session's % move (for change_pct)."""
+    if inst not in INSTRUMENTS and inst != 'SENSEX':
+        return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
+    day = date or datetime.now().strftime('%Y-%m-%d')
+    fut = _latest_ltp_from_ticks(inst, day)
+    spot, spot_ms, spot_chg, spot_pct = _latest_true_spot(inst, day)
+
+    # Fallbacks from the persisted futures history when there's no live tick or
+    # the spot file's % is missing (e.g. pre-open, or buggy historical spot).
+    fut_close, fc_chg, fc_pct = _futures_daily(inst, day)
+    live = fut is not None
+    if fut is None:
+        fut = fut_close                 # last session's futures close
+    if spot_pct is None:
+        spot_pct = fc_pct               # last session's % move (≈ index daily %)
+        spot_chg = spot_chg if spot_chg is not None else fc_chg
+
+    b = (fut - spot) if (fut and spot) else None
+    fresh = False
+    if spot_ms:
+        fresh = (0 <= (datetime.now().timestamp() * 1000 - spot_ms) / 1000.0 <= 600)
+    return JSONResponse({
+        'inst': inst, 'fut': round(fut, 1) if fut else None,
+        'spot': round(spot, 1) if spot else None,
+        'change': spot_chg, 'change_pct': spot_pct,
+        'basis': round(b, 1) if b is not None else None,
+        'live': live, 'fresh': fresh, 'spot_ms': spot_ms,
+    })
+
+
 @app.get('/volume_profile')
 async def volume_profile(inst: str = Query(...),
                           scope: str = 'prior_day',
-                          cell: Optional[float] = None):
+                          cell: Optional[float] = None,
+                          date: Optional[str] = None):
     if inst not in INSTRUMENTS:
         return JSONResponse({'error': f'unknown inst: {inst}'}, status_code=400)
     if scope not in ('prior_day', 'week'):
         scope = 'prior_day'
     cs = float(cell) if cell else DEFAULT_CELL[inst]
-    return JSONResponse(_build_volume_profile(inst, scope, cs))
+    ref = None
+    if date:
+        try:
+            from datetime import date as _date
+            ref = _date.fromisoformat(date)
+        except ValueError:
+            ref = None
+    return JSONResponse(_build_volume_profile(inst, scope, cs, ref_date=ref))
 
 
 @app.get('/dom_profile')

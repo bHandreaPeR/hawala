@@ -82,6 +82,7 @@ async function bootstrap () {
   const $date = document.getElementById('date');
   $date.value = cfg.today;
   state.date = cfg.today;
+  state.today = cfg.today;   // server "today" — used to detect replay vs live
 
   rebuildCellChoices();
 
@@ -97,6 +98,30 @@ async function bootstrap () {
     state.cell_size = parseFloat(e.target.value); fullReload();
   });
   $date.addEventListener('change', e => { state.date = e.target.value; fullReload(); });
+
+  // Positioning panel: click the title to collapse/expand (it can otherwise
+  // overlap the right-hand DOM/profile panes). State persists across reloads.
+  const posTitle = document.querySelector('.pos-title');
+  const posPanel = document.getElementById('positioning');
+  if (posTitle && posPanel) {
+    posTitle.addEventListener('click', () => {
+      posPanel.classList.toggle('collapsed');
+      localStorage.setItem('hawala_pos_collapsed',
+        posPanel.classList.contains('collapsed') ? '1' : '0');
+    });
+    if (localStorage.getItem('hawala_pos_collapsed') === '1')
+      posPanel.classList.add('collapsed');
+  }
+
+  // Full-screen toggle (whole document → immersive chart).
+  const fsBtn = document.getElementById('fullscreen');
+  if (fsBtn) fsBtn.addEventListener('click', () => {
+    if (!document.fullscreenElement) {
+      (document.documentElement.requestFullscreen || (()=>{})).call(document.documentElement);
+    } else {
+      (document.exitFullscreen || (()=>{})).call(document);
+    }
+  });
 
   document.getElementById('pause').addEventListener('click', e => {
     state.paused = !state.paused;
@@ -188,7 +213,7 @@ async function bootstrap () {
 async function fetchVolProfile () {
   try {
     const q = new URLSearchParams({inst: state.inst, scope: state.vp_scope,
-                                   cell: state.cell_size});
+                                   cell: state.cell_size, date: state.date});
     const r = await fetch('/volume_profile?' + q).then(r => r.json());
     state.vol_profile = (r && !r.error) ? r : null;
   } catch (e) { state.vol_profile = null; }
@@ -202,6 +227,69 @@ async function fetchOptionLevels () {
     state.option_levels = (r && r.available) ? r : null;
   } catch (e) { state.option_levels = null; }
   state.dirty = true;
+}
+
+// Live contango (futures − spot) for the header chip + heartbeat price tag.
+async function fetchBasis () {
+  try {
+    const q = new URLSearchParams({inst: state.inst, date: state.date});
+    const r = await fetch('/basis?' + q).then(r => r.json());
+    state.basis_info = (r && !r.error) ? r : null;
+  } catch (e) { state.basis_info = null; }
+  updateSpotBox();   // refreshes index quote + contango chip together
+}
+
+function updateContango () {
+  const el = document.getElementById('spot_basis');
+  if (!el) return;
+  const bi = state.basis_info;
+  if (!bi || bi.basis == null) { el.textContent = 'basis —'; el.className = 'spot-basis stale'; return; }
+  const sign = bi.basis > 0 ? '+' : '';
+  el.textContent = `basis ${sign}${bi.basis.toFixed(1)}`;
+  el.className = 'spot-basis' + (bi.fresh ? '' : ' stale');
+  el.title = `Contango — futures ${bi.fut ?? '—'} − spot ${bi.spot ?? '—'} = ${sign}${bi.basis}`
+           + (bi.fresh ? '' : ' (spot stale)');
+}
+
+// Heartbeat — rides the in-progress candle's tip. pulseHeartbeat() re-triggers
+// the ripple on each live tick + updates the price tag; positionHeartbeat()
+// pins it to the live (lastBk, lastClose) point in pixel space (so it tracks
+// zoom/pan/scroll). Hidden on replay or when the tip scrolls out of view.
+function pulseHeartbeat (price) {
+  const hb = document.getElementById('heartbeat');
+  const tag = document.getElementById('hb_tag');
+  if (!hb) return;
+  if (tag && price != null) {
+    tag.textContent = 'live ' + price.toLocaleString('en-IN', {maximumFractionDigits: 1});
+    if (state.tip) state.tip.y = price;   // tip follows the latest tick price
+  }
+  hb.classList.remove('stale', 'beat');
+  void hb.offsetWidth;             // force reflow so the animation restarts
+  hb.classList.add('beat');
+  positionHeartbeat();
+}
+
+function positionHeartbeat () {
+  const hb = document.getElementById('heartbeat');
+  const gd = document.getElementById('chart');
+  if (!hb || !gd) return;
+  const fl = gd._fullLayout;
+  if (isReplay() || !fl || !state.tip || !fl.xaxis || !fl.yaxis) {
+    hb.style.display = 'none'; return;
+  }
+  const xa = fl.xaxis, ya = fl.yaxis;
+  try {
+    const x0 = xa.r2l(xa.range[0]), x1 = xa.r2l(xa.range[1]);
+    const y0 = ya.r2l(ya.range[0]), y1 = ya.r2l(ya.range[1]);
+    const x = state.tip.x, y = state.tip.y;
+    if (x < Math.min(x0,x1) || x > Math.max(x0,x1) ||
+        y < Math.min(y0,y1) || y > Math.max(y0,y1)) {
+      hb.style.display = 'none'; return;     // tip scrolled out of view
+    }
+    hb.style.left = (xa._offset + xa.l2p(x)) + 'px';
+    hb.style.top  = (ya._offset + ya.l2p(y)) + 'px';
+    hb.style.display = 'flex';
+  } catch (e) { hb.style.display = 'none'; }
 }
 
 function updateZoomLabels () {
@@ -255,8 +343,16 @@ async function fullReload () {
   // Option-OI S&R levels — these EVOLVE intraday, so also re-fetched by the
   // 5s resync loop (see resyncRunningBucket) to track positioning shifts.
   await fetchOptionLevels();
+  await fetchBasis();
   redrawAll();
-  setStatus('live ✓');
+  setStatus(isReplay() ? `replay · ${state.date}` : 'live ✓');
+  // Heartbeat: live by default; on a replay there's no ticking, so park it.
+  const hb = document.getElementById('heartbeat');
+  const hbTag = document.getElementById('hb_tag');
+  if (hb) {
+    hb.classList.toggle('stale', isReplay());
+    if (isReplay() && hbTag) hbTag.textContent = 'replay';
+  }
   openWS();
   // Belt-and-suspenders: every RESYNC_MS, re-fetch /snapshot for the running
   // bucket only and overwrite local cells/candle for that bucket. Even if WS
@@ -269,7 +365,33 @@ async function fullReload () {
   state.positioning_timer = setInterval(fetchPositioning, RESYNC_MS);
 }
 
+function isReplay () { return state.date && state.today && state.date !== state.today; }
+
+// Top-left header = the INDEX SPOT + live index % change (from the spot
+// recorder via /basis). The near-month FUTURES price lives on the heartbeat
+// tag instead. Driven by the 5s basis poll — light, not per-tick.
+function updateSpotBox () {
+  const bi = state.basis_info;
+  const pxEl = document.getElementById('spot_px');
+  const chEl = document.getElementById('spot_chg');
+  if (pxEl) pxEl.textContent = (bi && bi.spot != null)
+    ? bi.spot.toLocaleString('en-IN', {maximumFractionDigits: 1}) : '—';
+  if (chEl) {
+    if (bi && bi.change_pct != null) {
+      const pct = bi.change_pct, sign = pct > 0 ? '+' : '';
+      const pts = (bi.change != null) ? `${sign}${bi.change.toFixed(1)} ` : '';
+      chEl.textContent = `${pts}(${sign}${pct.toFixed(2)}%)`;
+      chEl.className = 'spot-chg ' + (pct > 0.001 ? 'up' : pct < -0.001 ? 'down' : 'flat');
+    } else { chEl.textContent = '—'; chEl.className = 'spot-chg flat'; }
+  }
+  updateContango();
+}
+
 async function fetchPositioning () {
+  // The /positioning endpoint only knows LIVE state (flow/resting/INST/macro
+  // update in real time). On a historical replay those numbers don't apply to
+  // the date being viewed, so showing them would be misleading. Mark N/A.
+  if (isReplay()) { renderPositioningReplay(); return; }
   try {
     const q = new URLSearchParams({inst: state.inst, date: state.date});
     const r = await fetch('/positioning?' + q).then(r => r.json());
@@ -280,7 +402,24 @@ async function fetchPositioning () {
   } catch (e) { /* ignore — next tick retries */ }
 }
 
+function renderPositioningReplay () {
+  const panel = document.getElementById('positioning');
+  if (panel) panel.classList.add('replay');
+  ['pos_flow','pos_resting','pos_institutions','pos_macro','pos_composite']
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.classList.remove('bull','bear','flat'); el.classList.add('flat');
+      const v = el.querySelector('.pos-value'); if (v) v.textContent = '—';
+      const s = el.querySelector('.pos-sub');   if (s) s.textContent = 'live only';
+    });
+  const foot = document.getElementById('pos_updated');
+  if (foot) foot.textContent = `replay ${state.date} · positioning is live-only`;
+}
+
 function renderPositioning (p) {
+  const panel = document.getElementById('positioning');
+  if (panel) panel.classList.remove('replay');
   const apply = (id, c) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -362,6 +501,7 @@ async function resyncRunningBucket () {
     // Option-OI levels shift as positioning builds intraday — re-fetch so the
     // CE-resistance / PE-support / max-pain lines track through the day.
     fetchOptionLevels();
+    fetchBasis();
   } catch (e) { /* network blips are fine, next tick will retry */ }
 }
 
@@ -409,7 +549,10 @@ function openWS () {
     // Race during NIFTY ⇄ BANKNIFTY switches can otherwise pollute state with
     // cross-instrument cells (causes a 54k cell to appear in a NIFTY chart).
     if (m.inst && m.inst !== state.inst) return;
-    if (m.type === 'ticks') applyTicks(m.rows);
+    if (m.type === 'ticks') {
+      applyTicks(m.rows);
+      if (m.rows && m.rows.length) pulseHeartbeat(m.rows[m.rows.length - 1].price);
+    }
     if (m.type === 'depth') {
       state.depth = {ts_ms: m.ts_ms, bids: m.bids, asks: m.asks};
       state.depth_dirty = true;
@@ -417,7 +560,10 @@ function openWS () {
     // Feed-stall messages from the server-side WS streamer
     // (viewer/live_server.py emits these when no fresh ticks for ≥90 s
     // during market hours — the recorder is probably reconnecting).
-    if (m.type === 'stall') showStallBadge(m.stall_age_s);
+    if (m.type === 'stall') {
+      showStallBadge(m.stall_age_s);
+      const hb = document.getElementById('heartbeat'); if (hb) hb.classList.add('stale');
+    }
     if (m.type === 'resume') hideStallBadge();
   });
 
@@ -538,17 +684,126 @@ function recomputePOCs () {
   for (const k of sorted) { cum += k.delta_qty; k.cvd_qty = cum; }
 }
 
+// ─── Pre-market / no-tick view ──────────────────────────────────────────────
+// Draws the static reference levels (pivots, VP, option walls, last index
+// spot) on a session-width frame so the chart is useful before 09:15 and for
+// historical days with no tick capture. Persists for any date.
+function renderPreMarket () {
+  const piv = state.pivots && state.pivots.pivots;
+  const vp  = state.vol_profile;
+  const ol  = state.option_levels;
+  const bi  = state.basis_info;
+  const hb = document.getElementById('heartbeat'); if (hb) hb.style.display = 'none';
+
+  if (!piv && !(vp && vp.poc != null)) {
+    Plotly.react('chart', [{x:[], y:[], type:'scatter'}],
+      {title:{text:'no levels available yet for this day',
+              font:{color:'#8a93a0'}},
+       paper_bgcolor:'#0f1318', plot_bgcolor:'#0f1318'},
+      {responsive:true, displaylogo:false});
+    return;
+  }
+
+  const cs = state.cell_size;
+  const x0    = Date.parse(state.date + 'T09:00:00+05:30');
+  const xOpen = Date.parse(state.date + 'T09:15:00+05:30');
+  const x1    = Date.parse(state.date + 'T15:30:00+05:30');
+  const xRange = [x0, x1];
+
+  const shapes = [], annos = [], hov = [], ys = [];
+  const addHover = (y, text) => {
+    if (y == null) return;
+    const N = 30, xs = [], yy = [], ts = [];
+    for (let i = 0; i <= N; i++) { xs.push(x0 + (x1 - x0) * i / N); yy.push(y); ts.push(text); }
+    hov.push({x:xs, y:yy, mode:'markers', marker:{size:12, color:'rgba(0,0,0,0)'},
+              hoverinfo:'text', text:ts, xaxis:'x', yaxis:'y', showlegend:false});
+  };
+  const line = (y, color, dash, width) => {
+    if (y == null) return;
+    shapes.push({type:'line', xref:'x', yref:'y', x0:x0, x1:x1, y0:y, y1:y,
+                 line:{color, width:width||1.2, dash:dash||'solid'}, layer:'below'});
+    ys.push(y);
+  };
+  const label = (y, text, color, anchor) => {
+    annos.push({x: anchor === 'right' ? x1 : x0, y, xref:'x', yref:'y', text,
+                showarrow:false, xanchor:anchor||'left', yanchor:'middle',
+                font:{size:10, color}});
+  };
+
+  if (piv) {
+    [['R3',piv.R3,'#ff8a80','dot'],['R2',piv.R2,'#ef5350','dash'],
+     ['R1',piv.R1,'#ef5350','solid'],['P',piv.P,'#fdd835','dash'],
+     ['S1',piv.S1,'#26d0b0','solid'],['S2',piv.S2,'#26d0b0','dash'],
+     ['S3',piv.S3,'#80cbc4','dot']].forEach(([k,v,c,d]) => {
+      line(v, c, d, k==='P'?1.4:1.1); label(v, `<b>${k}</b> ${v.toFixed(1)}`, c, 'left');
+      addHover(v, `${k} · floor pivot ${v.toFixed(1)}`);
+    });
+  }
+  if (vp) {
+    const sl = vp.scope === 'week' ? '5-day' : 'prior day';
+    if (vp.poc != null) { line(vp.poc, '#a86ee0', 'solid', 1.8); addHover(vp.poc, `POC (${sl}) ${vp.poc.toFixed(0)} — fair value`); }
+    if (vp.vah != null) { line(vp.vah, 'rgba(150,90,200,0.6)', 'dot', 0.9); addHover(vp.vah, `VAH (${sl}) ${vp.vah.toFixed(0)}`); }
+    if (vp.val != null) { line(vp.val, 'rgba(150,90,200,0.6)', 'dot', 0.9); addHover(vp.val, `VAL (${sl}) ${vp.val.toFixed(0)}`); }
+    (vp.hvn || []).forEach(y => { line(y, 'rgba(168,110,224,0.55)', 'solid', 1.1); addHover(y, `HVN ${y.toFixed(0)} — acceptance wall`); });
+  }
+  if (ol && ol.available) {
+    const basis = (ol.basis != null) ? ol.basis : 0;
+    [['CE-wall',ol.ce_resistance,'#ef5350','dash'],
+     ['PE-wall',ol.pe_support,'#66bb6a','dash'],
+     ['MaxPain',ol.max_pain,'#ff8f00','dot']].forEach(([nm,px,c,d]) => {
+      if (px == null) return;
+      const y = px + basis;
+      line(y, c, d, 1.3);
+      label(y, `<b>${nm}</b> ${px.toFixed(0)}${basis?`→${y.toFixed(0)}`:''}`, c, 'right');
+      addHover(y, `${nm} strike ${px.toFixed(0)} · option-OI`);
+    });
+  }
+  if (bi && bi.spot != null) {
+    line(bi.spot, '#e6e9ee', 'dash', 1.4);
+    const pct = (bi.change_pct != null) ? ` (${bi.change_pct>0?'+':''}${bi.change_pct.toFixed(2)}%)` : '';
+    label(bi.spot, `<b>spot</b> ${bi.spot.toFixed(1)}${pct}`, '#e6e9ee', 'left');
+    addHover(bi.spot, `Last index spot ${bi.spot.toFixed(1)}${pct} — pre-open`);
+    hov.push({x:[xOpen], y:[bi.spot], mode:'markers',
+              marker:{size:9, color:'#e6e9ee', line:{color:'#0f1318', width:1}},
+              hoverinfo:'text', text:[`spot ${bi.spot.toFixed(1)}`],
+              xaxis:'x', yaxis:'y', showlegend:false});
+  }
+
+  const lo = ys.length ? Math.min(...ys) : 0;
+  const hi = ys.length ? Math.max(...ys) : 1;
+  const pad = (hi - lo) * 0.08 + cs * 2;
+  const yRange = [lo - pad, hi + pad];
+
+  annos.push({x:x0, y:hi + pad*0.5, xref:'x', yref:'y',
+    text:`PRE-OPEN · levels as of 09:00–09:15 · ${state.date}`,
+    showarrow:false, xanchor:'left', yanchor:'top',
+    font:{size:11, color:'#8a93a0'}});
+
+  const GRID = 'rgba(255,255,255,0.05)';
+  const layout = {
+    paper_bgcolor:'#0f1318', plot_bgcolor:'#0f1318', font:{color:'#aeb6c2', size:11},
+    margin:{l:55, r:15, t:18, b:38}, showlegend:false, hovermode:'closest',
+    xaxis:{type:'date', range:xRange, tickformat:'%H:%M', gridcolor:GRID, zeroline:false},
+    yaxis:{range:yRange, title:'price', tickformat:',d', gridcolor:GRID, zeroline:false},
+    shapes, annotations:annos,
+    hoverlabel:{bgcolor:'#161b22', bordercolor:'#2a313b', font:{color:'#e6e9ee', size:11}},
+    uirevision:`premarket|${state.inst}|${state.date}`,
+  };
+  const anchor = [{x:[x0, x1], y:[yRange[0], yRange[1]], mode:'markers',
+                   marker:{size:0.1, color:'rgba(0,0,0,0)'}, hoverinfo:'skip',
+                   xaxis:'x', yaxis:'y'}];
+  Plotly.react('chart', anchor.concat(hov), layout, {responsive:true, displaylogo:false});
+}
+
 // ─── Drawing — Plotly figure ────────────────────────────────────────────────
 function redrawAll () {
   const candles = [...state.candles_idx.values()].sort((a,b) => a.bucket - b.bucket);
   const cells   = state.snap.cells;
   if (candles.length === 0) {
-    Plotly.purge('chart');
-    Plotly.newPlot('chart',
-      [{x:[], y:[], type:'scatter'}],
-      {title:'no data yet — waiting for ticks…',
-       paper_bgcolor:'#fafafa', plot_bgcolor:'#fff'},
-      {responsive:true});
+    // No ticks yet (pre-open) OR a historical day we never recorded ticks for.
+    // Show the reference levels we DO have (pivots / VP / option walls / last
+    // index spot) so the chart is useful from 09:00, not blank.
+    renderPreMarket();
     return;
   }
 
@@ -573,13 +828,35 @@ function redrawAll () {
   const useQty = cells.some(c => c.total_qty > 0);
   const shapes = [], annos = [];
 
+  // Hover hit-areas for level LINES. Plotly shapes can't carry hover text, so
+  // for every level (pivots, POC/VAH/VAL, HVN, naked POC, option walls) we add
+  // a fat transparent scatter line that shows a tooltip describing the level.
+  // Lets us drop on-chart labels (HVN, POC) yet still explain every line.
+  const hoverTraces = [];
+  const addLevelHover = (y, text) => {
+    if (y == null) return;
+    // Many invisible marker points along the line so 'closest' hover snaps to
+    // one anywhere along it (a 2-point line only triggers near its endpoints).
+    const N = 30, xs = [], ys = [], ts = [];
+    for (let i = 0; i <= N; i++) {
+      xs.push(xRange[0] + (xRange[1] - xRange[0]) * i / N);
+      ys.push(y); ts.push(text);
+    }
+    hoverTraces.push({
+      x: xs, y: ys, mode: 'markers',
+      marker: {size: 12, color: 'rgba(0,0,0,0)'},
+      hoverinfo: 'text', text: ts,
+      xaxis: 'x', yaxis: 'y', showlegend: false,
+    });
+  };
+
   // value-area band per candle
   for (const c of candles) {
     shapes.push({
       type:'rect', xref:'x', yref:'y',
       x0:c.bucket - half_w, x1:c.bucket + half_w,
       y0:c.val - cs/2,      y1:c.vah + cs/2,
-      fillcolor:'rgba(46,125,50,0.06)', line:{width:0}, layer:'below',
+      fillcolor:'rgba(80,180,120,0.07)', line:{width:0}, layer:'below',
     });
   }
 
@@ -590,43 +867,49 @@ function redrawAll () {
     const bv = useQty ? c.buy_qty  : c.buy_ticks;
     const s_int = sv / (m.sell || 1);
     const b_int = bv / (m.buy  || 1);
-    const sCol = sv > 0 ? `rgba(239,83,80,${(0.10 + 0.75*s_int).toFixed(2)})`
-                        : 'rgba(239,83,80,0.06)';
-    const bCol = bv > 0 ? `rgba(38,166,154,${(0.10 + 0.75*b_int).toFixed(2)})`
-                        : 'rgba(38,166,154,0.06)';
+    // Dark-mode footprint colours: SELL = red (left), BUY = green (right).
+    // Intensity ∝ volume; faint base so empty cells are barely-there. Light
+    // hairline borders (a black border was invisible/inverted on dark).
+    const sCol = sv > 0 ? `rgba(239,83,80,${(0.16 + 0.72*s_int).toFixed(2)})`
+                        : 'rgba(239,83,80,0.05)';
+    const bCol = bv > 0 ? `rgba(38,200,140,${(0.16 + 0.72*b_int).toFixed(2)})`
+                        : 'rgba(38,200,140,0.05)';
+    const cellBorder = 'rgba(255,255,255,0.12)';
 
     shapes.push({type:'rect', xref:'x', yref:'y',
       x0:c.bucket - half_w, x1:c.bucket - body_w,
       y0:c.cell - cs/2,     y1:c.cell + cs/2,
-      fillcolor:sCol, line:{width:0.3, color:'rgba(0,0,0,0.18)'}});
+      fillcolor:sCol, line:{width:0.3, color:cellBorder}});
     shapes.push({type:'rect', xref:'x', yref:'y',
       x0:c.bucket + body_w, x1:c.bucket + half_w,
       y0:c.cell - cs/2,     y1:c.cell + cs/2,
-      fillcolor:bCol, line:{width:0.3, color:'rgba(0,0,0,0.18)'}});
+      fillcolor:bCol, line:{width:0.3, color:cellBorder}});
 
+    // Imbalance contour — colour by side so it's intuitive (green = stacked
+    // buying, red = stacked selling) rather than a neutral amber.
     if (c.imbalance === 'BUY') {
       shapes.push({type:'rect', xref:'x', yref:'y',
         x0:c.bucket + body_w, x1:c.bucket + half_w,
         y0:c.cell - cs/2,     y1:c.cell + cs/2,
-        fillcolor:'rgba(0,0,0,0)', line:{width:2, color:'#ffb300'}});
+        fillcolor:'rgba(0,0,0,0)', line:{width:1.6, color:'#4dffce'}});
     } else if (c.imbalance === 'SELL') {
       shapes.push({type:'rect', xref:'x', yref:'y',
         x0:c.bucket - half_w, x1:c.bucket - body_w,
         y0:c.cell - cs/2,     y1:c.cell + cs/2,
-        fillcolor:'rgba(0,0,0,0)', line:{width:2, color:'#ffb300'}});
+        fillcolor:'rgba(0,0,0,0)', line:{width:1.6, color:'#ff5a5a'}});
     }
 
     annos.push({
       x: c.bucket - (half_w + body_w)/2, y: c.cell,
       xref:'x', yref:'y', showarrow:false,
       text: c.imbalance === 'SELL' ? `<b>${fmtNum(sv)}</b>` : fmtNum(sv),
-      font:{size:9, color: sv > 0 ? '#b71c1c' : '#999'},
+      font:{size:7, color: sv > 0 ? '#ff7b72' : '#5a6472'},
     });
     annos.push({
       x: c.bucket + (half_w + body_w)/2, y: c.cell,
       xref:'x', yref:'y', showarrow:false,
       text: c.imbalance === 'BUY'  ? `<b>${fmtNum(bv)}</b>` : fmtNum(bv),
-      font:{size:9, color: bv > 0 ? '#0d6e63' : '#999'},
+      font:{size:7, color: bv > 0 ? '#3fd6c4' : '#5a6472'},
     });
   }
 
@@ -699,24 +982,30 @@ function redrawAll () {
   // narrows to the most recent slice. Clamped so we always see ≥6 candles.
   const lastBk  = candles[candles.length-1].bucket;
   const firstBk = candles[0].bucket;
-  const visCandles = Math.max(6, Math.round(candles.length / state.zoom_x));
-  // Always derive the window from zoom_x (don't gate on autoscroll). If we
-  // gated it, the ⇤⇥ toolbar zoom buttons would silently do nothing once the
-  // user had manually interacted (which auto-disables autoscroll). At
-  // zoom_x=1 visCandles == candles.length so startBk == firstBk (full range).
-  // The window is only *applied* to the axis when applyRange is true (follow
-  // mode or a button's force_range); native drag/pan is preserved otherwise.
-  const startBk = Math.max(firstBk, lastBk - (visCandles - 1) * tf_ms);
+  // Window by TIME span, not candle count. With intraday gaps (e.g. a data
+  // outage) the candle count is fewer than the number of time-slots, so a
+  // count-based window comes out too narrow and clips the START of the
+  // session. At zoom_x=1 this spans firstBk→lastBk (the WHOLE session);
+  // zoom_x>1 narrows to the most-recent fraction of the day. Applied to the
+  // axis only when applyRange is true (follow mode or a button's force_range);
+  // native drag/pan is preserved otherwise.
+  const fullSpan = Math.max(tf_ms, lastBk - firstBk);
+  const visSpan  = fullSpan / state.zoom_x;
+  const startBk  = Math.max(firstBk, lastBk - visSpan);
   const xRange = [startBk - tf_ms * 0.5, lastBk + tf_ms * 0.5];
 
-  // y: auto-fit to visible candles' highs/lows. Zoom_y contracts that span
-  // around the latest close → broker-style price-axis zoom.
+  // y: fit the FULL high-low range of the candles in view, centred on the
+  // DATA midpoint — not the last close, which off-centres the window and
+  // clips intraday extremes (e.g. a late-session low). zoom_y contracts span.
   const visibleCandles = candles.filter(c => c.bucket >= startBk);
   const yLo0 = Math.min(...visibleCandles.map(c => c.low));
   const yHi0 = Math.max(...visibleCandles.map(c => c.high));
-  const yMid = candles[candles.length-1].close;
+  const yMid = (yLo0 + yHi0) / 2;
   const yHalfSpan = ((yHi0 - yLo0) / 2 + 2 * cs) / state.zoom_y;
   const yRange = [yMid - yHalfSpan, yMid + yHalfSpan];
+  const visCandles = visibleCandles.length;
+
+  state.tip = {x: lastBk, y: candles[candles.length - 1].close};
 
   // ── Pivot lines (classic floor pivots from prior day's OHLC) ──────────
   // Drawn AFTER xRange/yRange are defined. Levels outside the visible
@@ -724,13 +1013,13 @@ function redrawAll () {
   if (state.pivots && state.pivots.pivots) {
     const piv = state.pivots.pivots;
     const levels = [
-      {k:'R3', v:piv.R3, color:'#b71c1c', dash:'dot',    weight:0.9},
+      {k:'R3', v:piv.R3, color:'#ff8a80', dash:'dot',    weight:0.9},
       {k:'R2', v:piv.R2, color:'#ef5350', dash:'dash',   weight:1.0},
       {k:'R1', v:piv.R1, color:'#ef5350', dash:'solid',  weight:1.2},
       {k:'P',  v:piv.P,  color:'#fdd835', dash:'dash',   weight:1.4},
-      {k:'S1', v:piv.S1, color:'#26a69a', dash:'solid',  weight:1.2},
-      {k:'S2', v:piv.S2, color:'#26a69a', dash:'dash',   weight:1.0},
-      {k:'S3', v:piv.S3, color:'#0d6e63', dash:'dot',    weight:0.9},
+      {k:'S1', v:piv.S1, color:'#26d0b0', dash:'solid',  weight:1.2},
+      {k:'S2', v:piv.S2, color:'#26d0b0', dash:'dash',   weight:1.0},
+      {k:'S3', v:piv.S3, color:'#80cbc4', dash:'dot',    weight:0.9},
     ];
     for (const L of levels) {
       if (L.v < yRange[0] - cs || L.v > yRange[1] + cs) continue;
@@ -740,13 +1029,16 @@ function redrawAll () {
         line: {color: L.color, width: L.weight, dash: L.dash},
         layer: 'below',
       });
+      // No background box — just crisp coloured text on the dark chart.
       annos.push({
         x: xRange[0], y: L.v, xref:'x', yref:'y',
         text: `<b>${L.k}</b> ${L.v.toFixed(1)}`,
         showarrow:false, xanchor:'left', yanchor:'middle',
-        bgcolor:'rgba(255,255,255,0.85)', bordercolor:L.color, borderwidth:1,
-        font:{size:9, color:L.color}, borderpad:2,
+        font:{size:10, color:L.color},
       });
+      const pivNames = {P:'Pivot (P)', R1:'Resistance 1', R2:'Resistance 2',
+        R3:'Resistance 3', S1:'Support 1', S2:'Support 2', S3:'Support 3'};
+      addLevelHover(L.v, `${pivNames[L.k] || L.k} · floor pivot ${L.v.toFixed(1)}`);
     }
   }
 
@@ -759,25 +1051,26 @@ function redrawAll () {
     const vp = state.vol_profile;
     const scopeLbl = vp.scope === 'week' ? 'wk' : 'pd';
     const inView = (y) => y >= yRange[0] - cs && y <= yRange[1] + cs;
+    // Volume-profile family (POC / VAH-VAL / naked POC / HVN / LVN gap) all
+    // share ONE left indent so they read as one group — distinct from the
+    // pivot family (hard left edge) and the option family (right edge).
+    const vpIndent = xRange[0] + (xRange[1] - xRange[0]) * 0.06;
 
     // Value-area band (translucent purple) between VAL and VAH
     if (vp.val != null && vp.vah != null) {
       shapes.push({
         type:'rect', xref:'x', yref:'y', layer:'below',
         x0: xRange[0], x1: xRange[1], y0: vp.val, y1: vp.vah,
-        fillcolor:'rgba(123,31,162,0.07)', line:{width:0},
+        fillcolor:'rgba(150,90,200,0.10)', line:{width:0},
       });
     }
-    // POC — bold purple line
+    // POC — bold purple line (no on-chart label; hover explains it)
     if (vp.poc != null && inView(vp.poc)) {
       shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
         x0:xRange[0], x1:xRange[1], y0:vp.poc, y1:vp.poc,
         line:{color:'#7b1fa2', width:1.8}});
-      annos.push({x:xRange[0], y:vp.poc, xref:'x', yref:'y',
-        text:`<b>POC·${scopeLbl}</b> ${vp.poc.toFixed(0)}`,
-        showarrow:false, xanchor:'left', yanchor:'bottom',
-        bgcolor:'rgba(255,255,255,0.85)', bordercolor:'#7b1fa2', borderwidth:1,
-        font:{size:9, color:'#7b1fa2'}, borderpad:2});
+      addLevelHover(vp.poc,
+        `POC (${scopeLbl==='wk'?'5-day':'prior day'}) ${vp.poc.toFixed(0)} — fair value / heaviest acceptance`);
     }
     // VAH / VAL dashed bounds
     [['VAH', vp.vah], ['VAL', vp.val]].forEach(([lbl, y]) => {
@@ -785,7 +1078,17 @@ function redrawAll () {
         shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
           x0:xRange[0], x1:xRange[1], y0:y, y1:y,
           line:{color:'rgba(123,31,162,0.5)', width:0.8, dash:'dot'}});
+        addLevelHover(y, `${lbl} (${scopeLbl==='wk'?'5-day':'prior day'}) ${y.toFixed(0)} — value-area ${lbl==='VAH'?'high (sellers)':'low (buyers)'}`);
       }
+    });
+    // HVN acceptance walls — purple lines, fainter/thinner than the bold POC.
+    // Shown in BOTH modes (legit S/R); no label, hover explains. Top-6 only.
+    (vp.hvn || []).forEach(y => {
+      if (!inView(y)) return;
+      shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
+        x0:xRange[0], x1:xRange[1], y0:y, y1:y,
+        line:{color:'rgba(168,110,224,0.55)', width:1.1}});
+      addLevelHover(y, `HVN ${y.toFixed(0)} — high-volume node / acceptance wall (hard to break)`);
     });
     // ↓↓↓ Experimental / detail overlays — Analysis mode only. ↓↓↓
     // (POC + value-area band above stay in Clean mode as key levels.)
@@ -801,21 +1104,13 @@ function redrawAll () {
         shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
           x0:xRange[0], x1:xRange[1], y0:pp.poc, y1:pp.poc,
           line:{color:'#ff6f00', width:1.2, dash:'dash'}});
-        annos.push({x:xRange[1], y:pp.poc, xref:'x', yref:'y',
+        annos.push({x:vpIndent, y:pp.poc, xref:'x', yref:'y',
           text:`nPOC ${pp.date.slice(5)}`,
-          showarrow:false, xanchor:'right', yanchor:'bottom',
+          showarrow:false, xanchor:'left', yanchor:'bottom',
           bgcolor:'rgba(255,255,255,0.8)', bordercolor:'#ff6f00', borderwidth:1,
           font:{size:8, color:'#ff6f00'}, borderpad:1});
+        addLevelHover(pp.poc, `Naked POC ${pp.date.slice(5)} ${pp.poc.toFixed(0)} — untested prior POC (price magnet)`);
       }
-    });
-    // HVN markers (acceptance walls) — left-margin purple ▸ (now capped to
-    // top 6 server-side, so no clutter).
-    (vp.hvn || []).forEach(y => {
-      if (inView(y)) annos.push({
-        x: xRange[0], y, xref:'x', yref:'y', xanchor:'left', yanchor:'middle',
-        text:'▸', showarrow:false, font:{size:11, color:'#7b1fa2'},
-        hovertext:`HVN ${y.toFixed(0)} — acceptance wall (hard to break)`,
-      });
     });
     // LVN gap ZONES — shaded grey rectangles (rejection vacuums where price
     // slices through fast). Clustered server-side into ≤3 zones, not spam.
@@ -828,7 +1123,8 @@ function redrawAll () {
         line:{width:0.5, color:'rgba(120,120,120,0.4)', dash:'dot'},
       });
       annos.push({
-        x: xRange[0], y: (z.lo + z.hi) / 2, xref:'x', yref:'y',
+        x: vpIndent, y: (z.lo + z.hi) / 2,
+        xref:'x', yref:'y',
         xanchor:'left', yanchor:'middle', text:'▹ gap',
         showarrow:false, font:{size:8, color:'#999'},
         hovertext:`LVN vacuum ${z.lo.toFixed(0)}-${z.hi.toFixed(0)} — `
@@ -847,6 +1143,15 @@ function redrawAll () {
     const ol = state.option_levels;
     const inView2 = (y) => y != null && y >= yRange[0] - cs && y <= yRange[1] + cs;
     const staleTag = ol.stale ? ` ⚠stale ${ol.day_used.slice(5)}` : '';
+    // Contango: walls are SPOT strikes; chart is FUTURES. Map each strike onto
+    // the futures axis by adding the (server-guarded) basis = futures − spot.
+    // If basis is null (spot missing/stale/insane) we plot at the raw strike.
+    const basisAdj = (ol.basis != null);
+    const basis = basisAdj ? ol.basis : 0;
+    const bSign = basis > 0 ? '+' : '';
+    const basisNote = basisAdj
+      ? ` · basis-adj ${bSign}${basis.toFixed(0)} (strike→fut)`
+      : ' · basis n/a (shown at strike)';
     const olLevels = [
       {px: ol.ce_resistance, name: 'CE-wall', color: '#c62828', dash: 'dash',
        note: 'call-OI resistance (writers defend above)'},
@@ -856,12 +1161,16 @@ function redrawAll () {
        note: 'max-pain magnet (writers lose least here)'},
     ];
     for (const L of olLevels) {
-      if (!inView2(L.px)) continue;
+      if (L.px == null) continue;
+      const yAdj = L.px + basis;            // futures-mapped level
+      if (!inView2(yAdj)) continue;
       shapes.push({type:'line', xref:'x', yref:'y', layer:'below',
-        x0:xRange[0], x1:xRange[1], y0:L.px, y1:L.px,
+        x0:xRange[0], x1:xRange[1], y0:yAdj, y1:yAdj,
         line:{color:L.color, width:1.3, dash:L.dash}});
-      annos.push({x:xRange[1], y:L.px, xref:'x', yref:'y',
-        text:`<b>${L.name}</b> ${L.px.toFixed(0)}${L.name==='CE-wall'?staleTag:''}`,
+      addLevelHover(yAdj,
+        `${L.name} strike ${L.px.toFixed(0)}${basisAdj?` → fut ${yAdj.toFixed(0)}`:''} — ${L.note} · PCR ${ol.pcr_oi}${basisNote}`);
+      annos.push({x:xRange[1], y:yAdj, xref:'x', yref:'y',
+        text:`<b>${L.name}</b> ${L.px.toFixed(0)}${basisAdj?`→${yAdj.toFixed(0)}`:''}${L.name==='CE-wall'?staleTag:''}`,
         showarrow:false, xanchor:'right', yanchor:'top',
         bgcolor:'rgba(255,255,255,0.85)', bordercolor:L.color, borderwidth:1,
         font:{size:9, color:L.color}, borderpad:2,
@@ -1051,6 +1360,28 @@ function redrawAll () {
   const profBuy  = prof.map(p => profUseQty ? p.buy_qty  : p.buy_ticks);
   const profSell = prof.map(p => profUseQty ? -p.sell_qty : -p.sell_ticks);
   const profY    = prof.map(p => p.cell);
+  // Per-level buy/sell numbers (both sides) + an OVERALL total per level.
+  const profSellLabels = prof.map(p => fmtNum(profUseQty ? p.sell_qty : p.sell_ticks));
+  const profBuyLabels  = prof.map(p => fmtNum(profUseQty ? p.buy_qty  : p.buy_ticks));
+  const profNet = prof.map(p => profUseQty ? (p.buy_qty - p.sell_qty)
+                                           : (p.buy_ticks - p.sell_ticks));
+  const profVol = prof.map(p => profUseQty ? (p.buy_qty + p.sell_qty)
+                                           : (p.buy_ticks + p.sell_ticks));
+  // x2 axis bound — right-anchors the NET column inside the BS pane.
+  const _profMax = Math.max(1, ...profBuy, ...profSell.map(Math.abs));
+  const prof2Max = _profMax * 1.15;
+  // NET (buy − sell) per price level — signed + colour-coded, right column.
+  prof.forEach((p, i) => {
+    if (profVol[i] <= 0) return;
+    const net = profNet[i];
+    const sign = net > 0 ? '+' : net < 0 ? '−' : '';
+    annos.push({
+      x: prof2Max * 0.98, y: p.cell, xref:'x2', yref:'y2',
+      text: `<b>${sign}${fmtNum(Math.abs(net))}</b>`, showarrow:false,
+      xanchor:'right', yanchor:'middle',
+      font:{size:7, color: net > 0 ? '#3fd6c4' : net < 0 ? '#ff7b72' : '#8a93a0'},
+    });
+  });
 
   // Bottom-pane delta histogram
   const dx = candles.map(k => k.bucket);
@@ -1080,39 +1411,48 @@ function redrawAll () {
   const xRangeOpt = applyRange ? {range: xRange} : {};
   const yRangeOpt = applyRange ? {range: yRange} : {};
 
+  // Dark theme palette (kept here so chart + CSS stay in sync).
+  const GRID = 'rgba(255,255,255,0.05)';
   const layout = {
-    paper_bgcolor:'#fafafa', plot_bgcolor:'#fff',
-    margin:{l:55, r:15, t:25, b:42},
+    paper_bgcolor:'#0f1318', plot_bgcolor:'#0f1318',
+    font:{color:'#aeb6c2', size:11},
+    margin:{l:55, r:15, t:18, b:38},
     showlegend:false,
     // domains: main=72%, session profile=12%, live DOM=14% (right edge).
     xaxis:  {type:'date', domain:[0, 0.72], ...xRangeOpt,
              dtick: tf_ms * xLabelStride, tickformat:'%H:%M', tick0: lastBk,
-             gridcolor:'#eef0f2', gridwidth:1, showspikes:false},
-    yaxis:  {domain:[0.27, 1], title:'price', side:'left', ...yRangeOpt,
+             gridcolor:GRID, gridwidth:1, showspikes:false, zeroline:false},
+    yaxis:  {domain:[0.32, 1], title:'price', side:'left', ...yRangeOpt,
              dtick: yDtick, tickformat:',d',
-             gridcolor:'#eef0f2', gridwidth:1},
-    // Session BS-summary pane — show qty labels at bottom so user knows scale
+             gridcolor:GRID, gridwidth:1, zeroline:false},
+    // Session BS-summary pane — more vertical gridlines (nticks) for scale.
     xaxis2: {domain:[0.73, 0.84], anchor:'y2', title:'BS qty',
-             showticklabels:true, tickfont:{size:9}, nticks:3,
-             gridcolor:'#eef0f2'},
-    yaxis2: {domain:[0.27, 1], matches:'y', showticklabels:false},
-    // Delta pane — matches:'x' so it ALWAYS mirrors the candle pane's
-    // zoom/pan (timestamps stay aligned, and panning the candles scrolls
-    // the delta histogram in lockstep — no separate range to fight).
+             showticklabels:true, tickfont:{size:9}, nticks:6,
+             range:[-prof2Max, prof2Max],
+             gridcolor:GRID, zeroline:true, zerolinecolor:'rgba(255,255,255,0.18)'},
+    yaxis2: {domain:[0.32, 1], matches:'y', showticklabels:false},
+    // Delta pane — pushed lower (bigger gap above) + matches:'x' so it mirrors
+    // the candle pane's zoom/pan in lockstep.
     xaxis3: {type:'date', domain:[0, 0.72], anchor:'y3', matches:'x',
-             tickformat:'%H:%M', gridcolor:'#eef0f2',
+             tickformat:'%H:%M', gridcolor:GRID,
              showticklabels:true, tickfont:{size:9}},
-    yaxis3: {domain:[0, 0.22], title:'Δ qty', gridcolor:'#eef0f2',
-             tickfont:{size:9}, nticks:4},
-    // Live DOM + session profile pane — show qty labels
+    yaxis3: {domain:[0, 0.18], title:'Δ qty', gridcolor:GRID,
+             tickfont:{size:9}, nticks:4, zeroline:true,
+             zerolinecolor:'rgba(255,255,255,0.18)'},
+    // Live DOM + session profile pane — more vertical gridlines.
     xaxis4: {domain:[0.86, 1.0], anchor:'y4', title:'DOM (live + session)',
-             showticklabels:true, tickfont:{size:9}, nticks:3,
-             zeroline:true, zerolinecolor:'#999', zerolinewidth:1,
-             gridcolor:'#eef0f2'},
-    yaxis4: {domain:[0.27, 1], matches:'y', showticklabels:false},
+             showticklabels:true, tickfont:{size:9}, nticks:6,
+             zeroline:true, zerolinecolor:'rgba(255,255,255,0.18)', zerolinewidth:1,
+             gridcolor:GRID},
+    yaxis4: {domain:[0.32, 1], matches:'y', showticklabels:false},
     shapes, annotations: annos,
     barmode:'overlay',
     uirevision: uirev,
+    hovermode:'closest',
+    modebar:{bgcolor:'rgba(0,0,0,0)', color:'#6b7480', activecolor:'#e6e9ee',
+             orientation:'v'},
+    hoverlabel:{bgcolor:'#161b22', bordercolor:'#2a313b',
+                font:{color:'#e6e9ee', size:11}},
   };
 
   const traces = [
@@ -1126,17 +1466,17 @@ function redrawAll () {
     {x: profSell, y: profY, type:'bar', orientation:'h',
      xaxis:'x2', yaxis:'y2',
      marker:{color:'rgba(239,83,80,0.85)'},
-     text: prof.map(p => fmtNum(profUseQty ? p.sell_qty : p.sell_ticks)),
-     textposition:'outside', cliponaxis:false,
-     textfont:{size:9, color:'#b71c1c'},
+     text: profSellLabels,
+     textposition:'inside', insidetextanchor:'end', cliponaxis:false,
+     textfont:{size:9, color:'#fff'},
      hovertemplate:'price=%{y}<br>sell=%{x:.0f}<extra></extra>'},
     // session profile (pane #2) — buy side (right of axis, positive x)
     {x: profBuy,  y: profY, type:'bar', orientation:'h',
      xaxis:'x2', yaxis:'y2',
      marker:{color:'rgba(38,166,154,0.85)'},
-     text: prof.map(p => fmtNum(profUseQty ? p.buy_qty : p.buy_ticks)),
-     textposition:'outside', cliponaxis:false,
-     textfont:{size:9, color:'#0d6e63'},
+     text: profBuyLabels,
+     textposition:'inside', insidetextanchor:'start', cliponaxis:false,
+     textfont:{size:9, color:'#fff'},
      hovertemplate:'price=%{y}<br>buy=%{x:.0f}<extra></extra>'},
     // delta histogram (bottom pane) — numeric labels on top of positive bars,
     // bottom of negative bars (Plotly's 'outside' handles this automatically).
@@ -1144,7 +1484,7 @@ function redrawAll () {
      xaxis:'x3', yaxis:'y3',
      text: dy.map(v => fmtNum(Math.abs(v))),
      textposition:'outside', cliponaxis:false,
-     textfont:{size:9, color:'#333'},
+     textfont:{size:9, color:'#aeb6c2'},
      hovertemplate:'%{x}<br>Δ=%{y:.0f}<extra></extra>'},
     // ─ Session DOM profile (drawn FIRST so live top-5 lands on top) ──────
     // Faint full-day mean resting qty bars. Top-3 walls each side get
@@ -1192,9 +1532,13 @@ function redrawAll () {
      textfont:{size:10, color:'#b71c1c'},
      hovertemplate:'LIVE ASK %{y}<br>qty=%{x:.0f}<extra></extra>'},
   ];
+  // Transparent hover hit-areas for every level line (added last so they sit
+  // on top and reliably catch the cursor).
+  traces.push(...hoverTraces);
 
   Plotly.react('chart', traces, layout,
                {responsive:true, displaylogo:false, scrollZoom:true});
+  positionHeartbeat();   // pin the live pulse to the candle tip after redraw
 
   // Wire the user-interaction listener ONCE (persists across Plotly.react).
   // When the user box-zooms ("snip") or pans the x-axis, drop out of follow
@@ -1210,6 +1554,7 @@ function redrawAll () {
           const b = document.getElementById('autoscroll');
           if (b) b.classList.remove('btn-active');
         }
+        positionHeartbeat();   // keep the live pulse glued to the tip on pan/zoom
       });
       state._relayout_wired = true;
     }

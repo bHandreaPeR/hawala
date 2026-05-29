@@ -1,12 +1,49 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: #fafafa; color: #222; }
+  background: #0f1318; color: #aeb6c2; }
 
 .topbar { display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 14px; background: #20262e; color: #f0f0f0;
-  border-bottom: 1px solid #111; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
-.brand { font-weight: 600; letter-spacing: 0.5px; }
+  padding: 7px 14px; background: #161b22; color: #e6e9ee;
+  border-bottom: 1px solid #2a313b; }
+/* Smooth, consistent control feel across the toolbar. */
+.btn, .controls select, .controls input[type="date"], .pos-card, .spot-chg {
+  transition: background-color .15s ease, border-color .15s ease, color .15s ease; }
+.brand { font-weight: 600; letter-spacing: 0.5px;
+  display: flex; align-items: baseline; gap: 12px; }
+.brand-name { font-size: 14px; }
+.spotbox { display: inline-flex; align-items: baseline; gap: 7px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.spot-px { font-size: 20px; font-weight: 700; color: #f0f0f0;
+  letter-spacing: 0.3px; }
+.spot-chg { font-size: 12px; font-weight: 600; padding: 1px 5px;
+  border-radius: 3px; }
+.spot-chg.up   { color: #69f0ae; background: rgba(38,166,154,0.16); }
+.spot-chg.down { color: #ff8a80; background: rgba(239,83,80,0.16); }
+.spot-chg.flat { color: #aab; }
+.spot-basis { font-size: 11px; color: #b39ddb; cursor: help;
+  border-left: 1px solid #3d4754; padding-left: 8px; }
+.spot-basis.stale { color: #8a7fb0; font-style: italic; }
+
+/* Heartbeat — rides the in-progress candle's tip (positioned by JS in px).
+   transform places the DOT (right-most child) on the price point; the tag
+   sits to its left and reveals on hover. */
+.heartbeat { position: absolute; left: 0; top: 0; z-index: 90;
+  transform: translate(-100%, -50%); display: none;
+  align-items: center; gap: 6px; pointer-events: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.hb-dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+  background: #26a69a; box-shadow: 0 0 0 0 rgba(38,166,154,0.6); }
+.heartbeat.beat .hb-dot { animation: hb-pulse 0.9s ease-out; }
+.heartbeat.stale .hb-dot { background: #ef5350; }
+.hb-tag { font-size: 11px; color: #455; background: rgba(255,255,255,0.9);
+  border: 1px solid #cdd; border-radius: 3px; padding: 1px 6px;
+  opacity: 0; transition: opacity 0.15s; white-space: nowrap; }
+.heartbeat:hover .hb-tag { opacity: 1; }
+@keyframes hb-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(38,166,154,0.6); }
+  100% { box-shadow: 0 0 0 9px rgba(38,166,154,0); }
+}
 .controls { display: flex; gap: 10px; align-items: center; font-size: 13px; }
 .controls label { display: flex; flex-direction: column; font-size: 10px;
   color: #aab; text-transform: uppercase; letter-spacing: 0.4px; gap: 2px; }
@@ -58,8 +95,8 @@ main { height: calc(100vh - 96px); padding: 0; }
 #chart { width: 100%; height: 100%; }
 
 .bottombar { position: fixed; bottom: 0; left: 0; right: 0;
-  background: #20262e; color: #aab; padding: 4px 14px; font-size: 11px;
-  display: flex; gap: 18px; border-top: 1px solid #111;
+  background: #161b22; color: #8a93a0; padding: 4px 14px; font-size: 11px;
+  display: flex; gap: 18px; border-top: 1px solid #2a313b;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .bottombar span { white-space: nowrap; }
 
@@ -86,7 +123,16 @@ main { position: relative; }
   display: flex; flex-direction: column; gap: 4px;
 }
 .pos-title { font-size: 9px; letter-spacing: 1.4px; color: #aab;
-  text-align: left; }
+  text-align: left; cursor: pointer; user-select: none; }
+.pos-title::after { content: ' ▾'; color: #667; }
+.pos-panel.collapsed .pos-title::after { content: ' ▸'; }
+/* Collapsed: keep the title + the COMPOSITE card (the one number that
+   matters) but drop the four component cards + footer, so the panel stops
+   covering the right-hand DOM / profile panes without going fully blind. */
+.pos-panel.collapsed .pos-foot { display: none; }
+.pos-panel.collapsed .pos-card:not(#pos_composite) { display: none; }
+/* Replay: dashed border + dimmed so it's obvious the live cards are N/A. */
+.pos-panel.replay { border-style: dashed; opacity: 0.9; }
 .pos-cards {
   display: flex; flex-direction: row;
   flex-wrap: wrap; gap: 6px;
@@ -127,5 +173,5 @@ main { position: relative; }
 .pos-foot { font-size: 9px; color: #667; text-align: right;
   font-style: italic; }
 
-/* Keep the panel above the fixed bottom bar */
-.pos-panel { bottom: 36px; }
+/* Sit just above the fixed bottom bar (pushed lower, out of the price area). */
+.pos-panel { bottom: 26px; }

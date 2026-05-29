@@ -8,7 +8,14 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">Hawala · Live Footprint</div>
+    <div class="brand">
+      <span class="brand-name">Hawala</span>
+      <span id="spotbox" class="spotbox" title="Last price · daily % change">
+        <span id="spot_px" class="spot-px">—</span>
+        <span id="spot_chg" class="spot-chg">—</span>
+        <span id="spot_basis" class="spot-basis" title="Contango — futures minus spot index">—</span>
+      </span>
+    </div>
     <div class="controls">
       <label>Symbol
         <select id="inst"></select>
@@ -42,12 +49,17 @@
       <button id="zoom_reset" class="btn btn-sm" title="Reset zoom">⊙</button>
       <button id="vp_scope" class="btn btn-sm" title="Volume-profile scope: prior trading day vs last 5 trading days">VP: prior day</button>
       <button id="view_mode" class="btn btn-sm" title="Clean = candles + key levels + positioning only. Analysis = + experimental entry markers / absorption / HVN-LVN (study only, do not trade).">🧭 Clean</button>
+      <button id="fullscreen" class="btn btn-sm" title="Toggle full screen">⛶</button>
       <button id="reload"  class="btn">⟳ Reload</button>
       <span id="status" class="status">connecting…</span>
     </div>
   </header>
   <main>
     <div id="chart"></div>
+    <div id="heartbeat" class="heartbeat" title="Live feed — hover for last futures price">
+      <span class="hb-tag" id="hb_tag">live —</span>
+      <span class="hb-dot"></span>
+    </div>
     <aside id="positioning" class="pos-panel" title="Unified positioning view — flow / resting / institutions / macro">
       <div class="pos-title">POSITIONING</div>
       <div class="pos-cards">
