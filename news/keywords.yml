@@ -21,7 +21,7 @@ geopolitical_deescalation:
   base_magnitude: 0.6
   triggers:
     peace:     [peace deal, peace pact, peace agreement, peace treaty, peace breakthrough, peace plan, peace accord, peace hopes, peace optimism, peace progress, peace talk, peace process, peace framework, peace memo, hopes of peace, hopes for peace]
-    ceasefire: [ceasefire, cease-fire, truce, armistice, stop fighting, halt hostilities, end of hostilities, lay down arms, cease hostilities, halt fighting, end fighting, end the war, end the conflict, end war, ending the war, ending hostilities, hostilities end, war ends, war over]
+    ceasefire: [ceasefire, cease-fire, truce, armistice, stop fighting, halt hostilities, end of hostilities, lay down arms, cease hostilities, halt fighting, end fighting, end the war, end the conflict, end war, end iran war, end the iran war, ends iran war, end of iran war, war to end, wind down war, war winding down, ending the war, ending hostilities, hostilities end, war ends, war over]
     sanctions: [sanctions lifted, sanctions removed, sanctions eased, sanctions relief, sanctions waived, ease sanctions, lift sanctions, remove sanctions, ease restrictions, drop sanctions, suspend sanctions, sanctions suspended]
     talks:     [talks resume, dialogue resumed, negotiations breakthrough, agreement reached, deal reached, deal signed, breakthrough talks, deal closer, closer to deal, closing in on deal, closing in on agreement, closing in on memo, near deal, near agreement, nearing deal, nearing agreement, move closer to deal, moving closer to deal, move closer to agreement, deal in sight, deal imminent, agreement imminent, memo to end, memo to end war, one-page memo, framework deal, mou signed, sign mou, draft deal, draft agreement]
     withdrawal: [troops withdraw, troop pullout, military withdrawal, troops pull out, withdraw forces, pull back troops, retreat forces, military pullback]
@@ -61,7 +61,11 @@ geopolitical_escalation:
     sanctions:   [new sanctions, sanctions imposed, sanctions expanded, additional sanctions, secondary sanctions, sanctions tightened, blacklist expanded]
     cyber:       [cyberattack, cyber attack, cyber strike, ransomware attack on, infrastructure cyberattack]
     hostage:     [hostage crisis, hostages taken, ship seized, ship hijacked, tanker seized, tanker attacked, tanker hit]
-    war_warn:    [war risk rises, war risk climbs, war fears, war fear, geopolitical risk rises, geopolitical risk surges, conflict risk, escalation risk, war windfall, war oil windfall, war drains, war roils, iran war, iran-us war, us-iran war, israel-iran war, ongoing war, war boosts, war drives, war disruption, war pressures]
+    # NOTE: bare "iran war" / "war boosts" etc. were removed — they false-fired
+    # escalation on DE-escalation ("end Iran war"), aftermath and oil/market
+    # commentary. Genuine escalation is caught by the `military` group below;
+    # the oil reaction is caught by oil_spike. Keep only forward-looking risk.
+    war_warn:    [war risk rises, war risk climbs, war fears, war fear, geopolitical risk rises, geopolitical risk surges, conflict risk, escalation risk, fresh strikes, new strikes]
     talks_fail:  [talks collapse, talks collapsed, peace talks collapse, peace talks fail, peace talks failed, talks fail, talks fall through, talks impasse, peace talks impasse, no deal reached, deal collapses, ceasefire collapses, ceasefire violated, ceasefire broken, peace deal collapses, peace deal fails, talks hit a wall, negotiations break down, talks break down, marathon talks fail]
   region_boost:
     iran: 1.3
@@ -87,8 +91,8 @@ monetary_dovish:
     fed:      [fed cuts rates, fed rate cut, fomc cuts, dovish fed, fed pivot, fed pauses, fed signals cut, powell dovish, fed eases, fed easing, rate cut, cuts rates, cut rates, slashes rates, slash rates, cuts interest rate, cut interest rate, fed lowers rates, lowers rates, lower rates, fed delivers cut, surprise rate cut, surprise cut]
     rbi:      [rbi cuts, rbi repo cut, rbi dovish, rbi pause, mpc cuts, rbi rate cut, das dovish, rbi lowers, rbi slashes, repo rate cut, repo cut]
     ecb_boj:  [ecb cuts, boj dovish, boe cuts, ecb pivot, lagarde dovish, ecb rate cut, boe rate cut]
-    qe:       [quantitative easing, asset purchase, balance sheet expansion, qe restart, restart qe, liquidity injection, liquidity boost]
-    rhetoric: [dovish, easing cycle, accommodative, supportive policy, rate cut bets, rate cut hopes, rate cut expected, rate cut likely, cut bets rise, dovish surprise, dovish tilt, more cuts ahead]
+    qe:       [quantitative easing, asset purchase, balance sheet expansion, qe restart, restart qe, liquidity injection]
+    rhetoric: [dovish, easing cycle, accommodative, supportive policy, rate cut bets, rate cut hopes, rate cut expected, rate cut likely, cut bets rise, dovish surprise, dovish tilt, fed cut expectations, fed cut bets]
     cpi_soft: [cpi cools, inflation cools, inflation slows, cpi softer, soft inflation, lower than expected inflation, inflation eases, cooler inflation, inflation below forecast, cpi miss]
   region_boost:
     rbi: 1.5
@@ -109,8 +113,8 @@ monetary_hawkish:
   triggers:
     fed:      [fed hikes, fed rate hike, fomc hikes, hawkish fed, fed accelerates, fed signals hike, powell hawkish, fed tightens, rate hike, raises rates, hikes rates, hike rates, fed raises, fed delivers hike, surprise rate hike, surprise hike, jumbo rate hike]
     rbi:      [rbi hikes, rbi repo hike, rbi hawkish, mpc hikes, das hawkish, repo rate hike, repo hike, rbi raises]
-    rhetoric: [hawkish, tightening, restrictive policy, higher for longer, rate hike bets, jumbo hike, hawkish surprise, hawkish tilt, more hikes ahead, sticky higher rates]
-    cpi_hot:  [cpi hot, inflation surges, sticky inflation, hotter than expected inflation, cpi hotter, inflation jumps, inflation accelerates, hot cpi, inflation above forecast]
+    rhetoric: [hawkish, tightening, restrictive policy, higher for longer, rate hike bets, jumbo hike, hawkish surprise, hawkish tilt, sticky higher rates, fed hike expectations, fed hike bets]
+    cpi_hot:  [cpi hot, hot cpi, hot inflation, hot us inflation, inflation surges, sticky inflation, hotter than expected inflation, cpi hotter, inflation jumps, inflation accelerates, inflation above forecast]
   region_boost:
     rbi: 1.5
     india: 1.5
@@ -159,7 +163,7 @@ financial_crisis:
   triggers:
     default: [sovereign default, debt default, default risk, contagion, debt crisis]
     banking: [bank run, bank collapse, banking crisis, bank fails, bank rescue, bailout]
-    market:  [circuit breaker, market halt, flash crash, rout, panic selling, blood on the street]
+    market:  [circuit breaker, market halt, flash crash, market rout, bond rout, equity rout, stock rout, sharp selloff, sell-off intensifies, panic selling, blood on the street]
 
 india_macro_positive:
   direction: +1
