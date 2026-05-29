@@ -372,6 +372,69 @@ def _option_symbol(expiry: date, strike: int, side: str) -> str:
             f"{expiry.strftime('%y')}-{strike}-{side}")
 
 
+def _chain_has_atm_oi(strikes: dict, spot: float) -> bool:
+    """True if a strike within ~2% of spot carries nonzero CE/PE OI — marks a
+    real, ACTIVE expiry (vs an empty / non-traded date)."""
+    if not strikes or spot <= 0:
+        return False
+    band = 0.02 * spot
+    for k, sides in strikes.items():
+        try:
+            if abs(float(k) - spot) > band:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(sides, dict):
+            continue
+        for s in ('CE', 'PE'):
+            oi = (sides.get(s) or {}).get('open_interest', 0) or 0
+            try:
+                if float(oi) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _resolve_weekly_option_expiry(g, today: date) -> date:
+    """Nearest TRADEABLE option expiry on/after today.
+
+    NIFTY trades WEEKLY options (Tuesday expiry) — the intraday ATM strategy
+    must use the live weekly, NOT the month-end. get_expiries has been observed
+    returning a stale, MONTHLY-only list that misses the active weekly, so we
+    build candidate dates (get_expiries results + the next 10 weekdays) and
+    return the SOONEST whose chain actually carries near-the-money OI. Falls
+    back to the monthly _nearest_tuesday_expiry if nothing probes clean (never
+    returns a junk date).
+
+    NOTE: FUTURES stay MONTHLY via _futures_symbol — only OPTIONS use this.
+    """
+    cands: set = set()
+    try:
+        r = g.get_expiries(exchange='NSE', underlying_symbol='NIFTY')
+        for e in (r or {}).get('expiries', []) or []:
+            if e >= today.isoformat():
+                cands.add(e)
+    except Exception as exc:
+        log.warning("get_expiries failed for NIFTY: %s (probing dates instead)", exc)
+    for i in range(1, 11):
+        d = today + timedelta(days=i)
+        if d.weekday() < 5:                       # expiries fall on weekdays
+            cands.add(d.isoformat())
+    for e in sorted(cands):
+        try:
+            r = g.get_option_chain(exchange='NSE', underlying='NIFTY', expiry_date=e)
+        except Exception:
+            continue
+        if r and _chain_has_atm_oi(r.get('strikes') or {},
+                                   float(r.get('underlying_ltp', 0) or 0)):
+            log.info("resolved nearest active NIFTY option expiry: %s", e)
+            return date.fromisoformat(e)
+    fb = _nearest_tuesday_expiry(today)
+    log.warning("no populated NIFTY weekly chain probed — falling back to monthly %s", fb)
+    return fb
+
+
 # ── Option chain fetch (primary per-minute feed) ─────────────────────────────
 def _fetch_option_chain(g, expiry: date) -> Optional[dict]:
     """
@@ -1298,10 +1361,12 @@ def run(paper: bool = True):
             fresh_pcr_val, fresh_pcr_ma,
         )
 
-    expiry  = _nearest_tuesday_expiry(today)
+    # OPTIONS: nearest live WEEKLY (probed) — NIFTY weeklies expire Tuesday and
+    # get_expiries can be stale. FUTURES: monthly (correct as-is).
+    expiry  = _resolve_weekly_option_expiry(g, today)
     fut_sym = _futures_symbol(today)
 
-    log.info("Futures symbol: %s   Option expiry: %s", fut_sym, expiry)
+    log.info("Futures symbol: %s   Option expiry: %s (weekly)", fut_sym, expiry)
 
     entry_target      = now.replace(hour=11, minute=0,  second=0, microsecond=0)
     last_entry_target = now.replace(
