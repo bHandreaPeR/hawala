@@ -83,7 +83,9 @@ research/footprint_*_*.html
 research/trade_explorer.html
 
 # ── Local dev tooling + transient data artifacts ──────────────
-.claude/
+# Ignore local .claude state but TRACK the shared subagent definitions.
+.claude/*
+!.claude/agents/
 trade_logs/manual_trades*.csv
 v3/cache/*.preBackport
 v3/cache/*.afternoon
