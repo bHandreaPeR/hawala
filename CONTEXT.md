@@ -516,3 +516,9 @@ Live-ops + analysis scaffolding layered on top of the (unchanged) strategy stack
 - **GOTCHA:** monitor/option_flow/viewer hold old code until restarted after
   a `.py` edit (`launchctl kickstart -k gui/$(id -u)/com.hawala.monitor`, or
   kill+monitor-respawn during market hours).
+- **News runs 24/7** (`com.hawala.news_runner`, KeepAlive, `--always`,
+  `NEWS_CYCLE_SEC=60`): the viewer MACRO card + skynet news alerts are the
+  same pipeline and now stay fresh round the clock (off-hours US/geopolitical
+  news). EOD digest still fires at the real 15:30 close; singleton guard +
+  alert caps prevent double-run and off-hours spam. **Remove the old
+  `0 9 * * 1-5 … news.runner` cron line** — the agent supersedes it.

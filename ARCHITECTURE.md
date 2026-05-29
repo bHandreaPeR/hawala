@@ -292,3 +292,23 @@ Code edits to `monitor`/`option_flow_daemon`/viewer do **not** take effect
 until the process is restarted (they hold old code in memory). After changing
 their `.py`, restart: kill + let the monitor respawn (market hours), or
 `launchctl kickstart -k gui/$(id -u)/com.hawala.monitor` for the monitor.
+
+### 8.7 News pipeline runs 24/7 (`com.hawala.news_runner`)
+
+The viewer's MACRO positioning card and the skynet (MACRO-channel) news
+alerts are the **same** pipeline: `news/runner.py` scrapes ~13 tiered RSS
+feeds → keyword-scores (`scorer.py` + `keywords.yml`) → clusters/aggregates →
+`global_agg` → both `dispatcher.update_signal_file()` (writes
+`v3/cache/news_signal.json`, read by the viewer) and `dispatcher.maybe_alert()`
+(MACRO Telegram). The viewer MACRO value = `clamp(score × confidence, ±1)`.
+
+Runs **24/7** via a KeepAlive launchd agent with `--always` (`NEWS_CYCLE_SEC=60`)
+so the card + alerts stay fresh overnight/pre-market (off-hours US +
+geopolitical news gaps the Indian open). Polling is decoupled from the market
+window, so the EOD digest still fires on the real 15:30 close. A PID-based
+singleton guard prevents the agent, the legacy 09:00 cron, and manual starts
+from double-running. Alert caps (score≥0.60, conf≥0.70, ≤4/hr, ≤12/day,
+120-min theme cooldown) keep 24/7 alerting to high-conviction only.
+
+> Migration: remove the old `0 9 * * 1-5 … -m news.runner` crontab line —
+> the launchd agent supersedes it (the singleton guard makes it safe regardless).
