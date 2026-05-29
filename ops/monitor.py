@@ -73,6 +73,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 CHECK_INTERVAL_S       = 30
 GRACE_AFTER_RESTART_S  = 45     # let the new process warm up before re-checking
 MAX_RESTARTS_PER_HOUR  = 3      # beyond this, escalate + stop restarting
+STARTUP_GRACE_SEC = int(os.environ.get('MONITOR_STARTUP_GRACE_SEC', '180'))  # don't restart a just-launched (warming-up) daemon
 MARKET_OPEN  = dtime(9, 10)
 # IMPORTANT: must be EARLIER than every monitored daemon's END_HHMM
 # (currently 15:35 for tick_recorder, spot_vix_recorder, vp_paper_executor,
@@ -229,6 +230,51 @@ def _market_hours_now() -> bool:
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
 
+def _all_pids(pattern: str) -> list:
+    """ALL python/caffeinate pids matching pattern — so a restart kills the
+    whole instance chain (not just the first pid, which left duplicates)."""
+    out = []
+    try:
+        res = subprocess.check_output(['pgrep', '-f', pattern], text=True, timeout=5).strip()
+    except Exception:
+        return out
+    for s in res.split('\n'):
+        if not s.strip():
+            continue
+        try:
+            pid = int(s)
+            cmd = subprocess.check_output(['ps', '-p', str(pid), '-o', 'command='],
+                                          text=True, timeout=3).strip()
+            if 'pgrep' in cmd:
+                continue
+            if 'python' in cmd.lower() or 'caffeinate' in cmd.lower():
+                out.append(pid)
+        except Exception:
+            continue
+    return out
+
+
+def _proc_age_sec(pattern: str) -> Optional[float]:
+    """Elapsed seconds since the matching python process started (None if down).
+    Startup grace so a freshly-launched daemon isn't restarted mid-warmup."""
+    pid = _process_running(pattern)
+    if not pid:
+        return None
+    try:
+        et = subprocess.check_output(['ps', '-p', str(pid), '-o', 'etime='],
+                                     text=True, timeout=3).strip()
+        days = 0
+        if '-' in et:
+            d, et = et.split('-', 1); days = int(d)
+        parts = [int(x) for x in et.split(':')]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        h, m, sec = parts
+        return days * 86400 + h * 3600 + m * 60 + sec
+    except Exception:
+        return None
+
+
 # ─── Restart helper ─────────────────────────────────────────────────────────
 def _kill(pid: int) -> None:
     try:
@@ -250,10 +296,11 @@ def _kill(pid: int) -> None:
 def _restart(target: Target) -> bool:
     """Kill any matching processes, then run restart_cmd. Returns True on success."""
     log.info('restarting %s', target.name)
-    pid = _process_running(target.proc_pattern)
-    if pid:
-        log.info('  killing wedged %s (pid=%d)', target.name, pid)
+    pids = _all_pids(target.proc_pattern)
+    for pid in pids:
+        log.info('  killing %s (pid=%d)', target.name, pid)
         _kill(pid)
+    if pids:
         time.sleep(2)
     # Spawn new
     try:
@@ -399,6 +446,14 @@ def _check_one(t: Target, state: TargetState, dry_run: bool) -> None:
 
     # Within grace period after recent restart? skip
     if time.time() - state.last_restart_ts < t.grace_period_s:
+        return
+
+    # STARTUP grace: a matching process exists but is very young (just launched
+    # by cron/launchd at market open). Give it time to write its first log
+    # before judging it "stale" — prevents the cold-start false-restart that
+    # spawned duplicate daemons every morning.
+    age = _proc_age_sec(t.proc_pattern)
+    if age is not None and age < STARTUP_GRACE_SEC:
         return
 
     # why_unhealthy() may raise (e.g. f-string formatting None) — don't let
